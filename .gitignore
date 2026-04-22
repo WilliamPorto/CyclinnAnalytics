@@ -10,6 +10,7 @@ node_modules/
 .next/
 out/
 frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
 
 # OS / editor
 .DS_Store
@@ -19,5 +20,6 @@ frontend/next-env.d.ts
 # Dados (parquets são gerados pelo script; descomente se quiser versionar)
 # data/
 
-# PDF interno (confidencial — mantenha fora do repo)
+# Material interno / PII (confidencial — mantenha fora do repo)
 regras.pdf
+tmp/

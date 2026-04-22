@@ -1,0 +1,24 @@
+{
+  "name": "cyclinn-pricing-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.8.0",
+    "@uiw/react-codemirror": "^4.23.7",
+    "next": "14.2.15",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.10",
+    "@types/react": "18.3.11",
+    "@types/react-dom": "18.3.0",
+    "typescript": "5.6.2"
+  }
+}

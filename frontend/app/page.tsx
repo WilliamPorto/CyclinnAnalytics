@@ -99,13 +99,13 @@ export default function Page() {
     <main onKeyDown={onKeyDown} style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100vh" }}>
       <aside
         style={{
-          borderRight: "1px solid #1e293b",
-          background: "#0b1220",
+          borderRight: "1px solid #e2e8f0",
+          background: "#f8fafc",
           overflow: "auto",
           padding: "16px 12px",
         }}
       >
-        <h1 style={{ fontSize: 14, letterSpacing: 0.3, margin: "0 0 12px 4px", color: "#93c5fd" }}>
+        <h1 style={{ fontSize: 14, letterSpacing: 0.3, margin: "0 0 12px 4px", color: "#1d4ed8" }}>
           cyclinn_pricing
         </h1>
         {Object.keys(schemas).length === 0 && (
@@ -122,7 +122,7 @@ export default function Page() {
                   textAlign: "left",
                   background: "transparent",
                   border: 0,
-                  color: "#fbbf24",
+                  color: "#b45309",
                   fontWeight: 600,
                   padding: "4px 6px",
                   fontSize: 13,
@@ -143,14 +143,14 @@ export default function Page() {
                           width: "100%",
                           background: "transparent",
                           border: 0,
-                          color: "#e2e8f0",
+                          color: "#1e293b",
                           padding: "3px 4px",
                           fontSize: 12.5,
                           fontFamily: "inherit",
                         }}
                       >
                         <span>{t.table}</span>
-                        <span style={{ color: "#64748b", fontSize: 11 }}>{t.row_count}</span>
+                        <span style={{ color: "#94a3b8", fontSize: 11 }}>{t.row_count}</span>
                       </button>
                     </li>
                   ))}
@@ -162,11 +162,11 @@ export default function Page() {
       </aside>
 
       <section style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        <div style={{ borderBottom: "1px solid #1e293b", height: "38vh", minHeight: 180 }}>
+        <div style={{ borderBottom: "1px solid #e2e8f0", height: "38vh", minHeight: 180 }}>
           <CodeMirror
             value={sqlText}
             height="100%"
-            theme="dark"
+            theme="light"
             extensions={extensions}
             onChange={setSqlText}
             onCreateEditor={(view) => (viewRef.current = view)}
@@ -187,8 +187,8 @@ export default function Page() {
             alignItems: "center",
             gap: 12,
             padding: "8px 14px",
-            background: "#0b1220",
-            borderBottom: "1px solid #1e293b",
+            background: "#f8fafc",
+            borderBottom: "1px solid #e2e8f0",
           }}
         >
           <button
@@ -210,14 +210,14 @@ export default function Page() {
               : "▶ Run (Ctrl+Enter)"}
           </button>
           {result && (
-            <span style={{ color: "#94a3b8", fontSize: 12 }}>
+            <span style={{ color: "#64748b", fontSize: 12 }}>
               {result.row_count} linha{result.row_count === 1 ? "" : "s"} · {result.duration_ms} ms
               {result.truncated && (
-                <span style={{ color: "#f59e0b", marginLeft: 8 }}>(truncado em 5000)</span>
+                <span style={{ color: "#d97706", marginLeft: 8 }}>(truncado em 5000)</span>
               )}
             </span>
           )}
-          {error && <span style={{ color: "#f87171", fontSize: 12 }}>{error}</span>}
+          {error && <span style={{ color: "#dc2626", fontSize: 12 }}>{error}</span>}
         </div>
 
         <div style={{ flex: 1, overflow: "auto", padding: 0 }}>
@@ -230,20 +230,20 @@ export default function Page() {
 
 function ResultTable({ result }: { result: QueryResult }) {
   if (result.columns.length === 0) {
-    return <div style={{ padding: 16, color: "#94a3b8" }}>Query executada (sem colunas).</div>;
+    return <div style={{ padding: 16, color: "#64748b" }}>Query executada (sem colunas).</div>;
   }
   return (
     <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5 }}>
       <thead>
-        <tr style={{ position: "sticky", top: 0, background: "#0b1220", zIndex: 1 }}>
+        <tr style={{ position: "sticky", top: 0, background: "#f1f5f9", zIndex: 1 }}>
           {result.columns.map((c) => (
             <th
               key={c}
               style={{
                 textAlign: "left",
                 padding: "8px 12px",
-                borderBottom: "1px solid #334155",
-                color: "#93c5fd",
+                borderBottom: "1px solid #cbd5e1",
+                color: "#1d4ed8",
                 fontWeight: 600,
                 whiteSpace: "nowrap",
               }}
@@ -255,15 +255,15 @@ function ResultTable({ result }: { result: QueryResult }) {
       </thead>
       <tbody>
         {result.rows.map((row, i) => (
-          <tr key={i} style={{ background: i % 2 ? "#0f172a" : "#111d33" }}>
+          <tr key={i} style={{ background: i % 2 ? "#ffffff" : "#f8fafc" }}>
             {row.map((v, j) => (
               <td
                 key={j}
                 style={{
                   padding: "6px 12px",
-                  borderBottom: "1px solid #1e293b",
+                  borderBottom: "1px solid #e2e8f0",
                   whiteSpace: "nowrap",
-                  color: v === null ? "#64748b" : "#e2e8f0",
+                  color: v === null ? "#94a3b8" : "#0f172a",
                   fontFamily: typeof v === "number" ? "inherit" : "inherit",
                   textAlign: typeof v === "number" ? "right" : "left",
                 }}

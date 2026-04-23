@@ -106,8 +106,8 @@ export default function Page() {
     [runQuery]
   );
 
-  const insertAtCursor = useCallback((text: string) => {
-    setSqlText((curr) => (curr.endsWith("\n") || curr.length === 0 ? curr + text : curr + "\n" + text));
+  const replaceQuery = useCallback((text: string) => {
+    setSqlText(text);
   }, []);
 
   const extensions = useMemo(() => [sql({ dialect: PostgreSQL, upperCaseKeywords: true })], []);
@@ -152,8 +152,8 @@ export default function Page() {
                   {tables.map((t) => (
                     <li key={t.table}>
                       <button
-                        onClick={() => insertAtCursor(`SELECT * FROM ${schema}.${t.table} LIMIT 100;`)}
-                        title={`${t.row_count} linhas — clicar insere SELECT no editor`}
+                        onClick={() => replaceQuery(`SELECT * FROM ${schema}.${t.table} LIMIT 100;`)}
+                        title={`${t.row_count} linhas — clicar substitui a query no editor`}
                         style={{
                           display: "flex",
                           justifyContent: "space-between",

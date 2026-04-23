@@ -12,6 +12,7 @@ Execução:
 from __future__ import annotations
 
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -238,6 +239,158 @@ def run_query(req: QueryRequest) -> QueryResponse:
         duration_ms=duration_ms,
         truncated=truncated,
     )
+
+
+# ============================================================
+# Endpoints do simulador (dashboards)
+# ============================================================
+
+# (value_col, format, row_type)
+SIMULADOR_TABLES: dict[str, tuple[str, str, str]] = {
+    "pb":                    ("valor",                  "currency", "unidade"),
+    "fat_sazonalidade":      ("ajuste_pct",             "percent",  "unidade"),
+    "fat_dia_semana":        ("ajuste_pct",             "percent",  "unidade"),
+    "fat_eventos":           ("ajuste_pct",             "percent",  "unidade"),
+    "fat_antecedencia":      ("ajuste_pct",             "percent",  "unidade"),
+    "fat_ajuste_portfolio":  ("ajuste_pct",             "percent",  "unidade"),
+    "fat_ajuste_individual": ("ajuste_pct",             "percent",  "unidade"),
+    "pi":                    ("valor",                  "currency", "unidade"),
+    "d":                     ("valor",                  "currency", "unidade"),
+    "ocupacao_portfolio":    ("ocupacao_pct",           "percent",  "portfolio"),
+    "expectativa_portfolio": ("ocupacao_esperada_pct",  "percent",  "portfolio"),
+}
+
+
+@app.get("/simulador/tables")
+def simulador_tables() -> dict:
+    """Lista configuração das 11 tabelas-matriz para o dashboard."""
+    return {
+        name: {"value_col": v, "format": fmt, "row_type": rt}
+        for name, (v, fmt, rt) in SIMULADOR_TABLES.items()
+    }
+
+
+@app.get("/simulador/data-referencias")
+def simulador_data_referencias() -> dict:
+    rows = CON.execute(
+        f"""
+        SELECT DISTINCT data_referencia
+        FROM {SIMULADOR_ALIAS}.main.simulador_meta
+        ORDER BY data_referencia DESC
+        """
+    ).fetchall()
+    return {"values": [r[0].isoformat() for r in rows]}
+
+
+@app.get("/simulador/matrix/{table}")
+def simulador_matrix(
+    table: str,
+    data_referencia: str,
+    data_inicio: str,
+    data_fim: str,
+    page: int = 1,
+    page_size: int = 25,
+) -> dict:
+    if table not in SIMULADOR_TABLES:
+        raise HTTPException(status_code=404, detail=f"Tabela '{table}' não suportada")
+
+    value_col, fmt, row_type = SIMULADOR_TABLES[table]
+
+    try:
+        d_ref = date.fromisoformat(data_referencia)
+        d_ini = date.fromisoformat(data_inicio)
+        d_fim = date.fromisoformat(data_fim)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Data inválida: {e}")
+
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="data_fim anterior a data_inicio")
+
+    page = max(1, int(page))
+    page_size = max(1, min(200, int(page_size)))
+    offset = (page - 1) * page_size
+
+    # Linhas da página + total (unidades ou regiões)
+    if row_type == "unidade":
+        total = CON.execute("SELECT COUNT(*) FROM cadastro.unidades").fetchone()[0]
+        label_rows = CON.execute(
+            f"""
+            SELECT unidade_id, codigo_externo
+            FROM cadastro.unidades
+            ORDER BY codigo_externo
+            LIMIT {page_size} OFFSET {offset}
+            """
+        ).fetchall()
+        key_col = "unidade_id"
+    else:
+        total = CON.execute("SELECT COUNT(*) FROM cadastro.regioes").fetchone()[0]
+        label_rows = CON.execute(
+            f"""
+            SELECT regiao_id, nome
+            FROM cadastro.regioes
+            ORDER BY nome
+            LIMIT {page_size} OFFSET {offset}
+            """
+        ).fetchall()
+        key_col = "portfolio_id"
+
+    ids = [r[0] for r in label_rows]
+    labels = {r[0]: r[1] for r in label_rows}
+
+    # Colunas de data
+    date_cols: list[str] = []
+    cur = d_ini
+    while cur <= d_fim:
+        date_cols.append(cur.isoformat())
+        cur += timedelta(days=1)
+
+    # Valores (apenas linhas da página)
+    matrix_rows: list[dict] = []
+    if ids:
+        ids_list = ",".join(str(i) for i in ids)
+        values_rows = CON.execute(
+            f"""
+            SELECT {key_col} AS id, data, {value_col} AS v
+            FROM {SIMULADOR_ALIAS}.main.{table}
+            WHERE data_referencia = DATE '{d_ref.isoformat()}'
+              AND data BETWEEN DATE '{d_ini.isoformat()}' AND DATE '{d_fim.isoformat()}'
+              AND {key_col} IN ({ids_list})
+            """
+        ).fetchall()
+        lookup: dict[tuple[int, str], Any] = {}
+        for rid, dt, v in values_rows:
+            lookup[(rid, dt.isoformat())] = v
+        for rid in ids:
+            vals = [lookup.get((rid, d)) for d in date_cols]
+            matrix_rows.append({"id": rid, "label": labels[rid], "values": vals})
+
+    # Min/max globais (considerando TODAS as linhas no período — não só a página)
+    stats = CON.execute(
+        f"""
+        SELECT MIN({value_col}), MAX({value_col})
+        FROM {SIMULADOR_ALIAS}.main.{table}
+        WHERE data_referencia = DATE '{d_ref.isoformat()}'
+          AND data BETWEEN DATE '{d_ini.isoformat()}' AND DATE '{d_fim.isoformat()}'
+        """
+    ).fetchone()
+    vmin = float(stats[0]) if stats[0] is not None else 0.0
+    vmax = float(stats[1]) if stats[1] is not None else 0.0
+
+    return {
+        "table": table,
+        "data_referencia": data_referencia,
+        "data_inicio": data_inicio,
+        "data_fim": data_fim,
+        "format": fmt,
+        "row_type": row_type,
+        "columns": date_cols,
+        "rows": matrix_rows,
+        "total_rows": total,
+        "page": page,
+        "page_size": page_size,
+        "min": vmin,
+        "max": vmax,
+    }
 
 
 @app.post("/reload")

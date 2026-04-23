@@ -113,7 +113,7 @@ export default function Page() {
   const extensions = useMemo(() => [sql({ dialect: PostgreSQL, upperCaseKeywords: true })], []);
 
   return (
-    <main onKeyDown={onKeyDown} style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100vh" }}>
+    <main onKeyDown={onKeyDown} style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100%" }}>
       <aside
         style={{
           borderRight: "1px solid #e2e8f0",

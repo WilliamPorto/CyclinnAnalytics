@@ -20,6 +20,10 @@ frontend/tsconfig.tsbuildinfo
 # Dados (parquets são gerados pelo script; descomente se quiser versionar)
 # data/
 
+# DB do simulador (gerado por simulador/backend/build_simulator_db.py)
+simulador/backend/*.duckdb
+simulador/backend/*.duckdb.wal
+
 # Material interno / PII (confidencial — mantenha fora do repo)
 regras.pdf
 tmp/

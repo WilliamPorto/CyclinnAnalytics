@@ -31,7 +31,7 @@ Onde `u` = unidade, `d` = dia, `Pb` = preço base por faixa de precificação.
 |---|---|
 | Fórmula principal (D e Pi) | Clara e implementável |
 | Antecedência — 4 faixas não-cumulativas (180-365, 90-180, 30-90, 0-15) | Completa, com detalhamento por dia da semana na faixa 0-15 |
-| Ocupação individual — thresholds por janela (21d, 14d, 7d, 5d, 3d, 1d, no dia) | Thresholds e percentuais definidos |
+| Ocupação individual — thresholds por janela (21d, 14d, 7d, 5d, 3d, 1d, no dia) | Thresholds e percentuais definidos (ver AMB-02 para leitura atual de "Cumulativo") |
 | Proposta de estrutura em tabelas (uma por fator, "caminham" 1 dia/dia) | Boa base para MVP em planilha |
 | Conceito de `ExpectativaPortfolio` vs ocupação atual | Direção correta |
 
@@ -51,13 +51,40 @@ Três leituras possíveis:
 
 **Impacto:** determina se uma unidade vazia em portfólio vazio pega -20% ou -10%.
 
-### AMB-02 — "Ocupação (Cumulativo)" cumulativo com quem?
-As janelas (21d, 14d, 7d, 5d, 3d, 1d, no dia) **se sobrepõem**. Três interpretações:
-- **(a)** Todas as janelas aplicáveis somam — unidade vazia pega `-10% + -10% + -10% + -10% = -40%`, o que **quebra margem**.
-- **(b)** Somente a janela mais curta aplicável vale — aí não é cumulativo de fato.
-- **(c)** Cumulativo entre `AjustePortfolio` e `AjusteIndividual`, mas só a janela mais curta dentro de cada camada.
+### AMB-02 — "Ocupação (Cumulativo)" — semântica (hipótese forte, a confirmar)
 
-**Impacto:** comportamento do preço em baixa ocupação muda drasticamente.
+> **Atualização 2026-04-23:** leitura refinada após discussão interna. O PDF suporta essa leitura, mas ainda precisa da confirmação da Cyclinn.
+
+**Leitura refinada — janelas não se sobrepõem + bandas mutuamente exclusivas**
+
+O rótulo **"21+"** no PDF indica que cada dia cai em **exatamente um bucket**, baseado em quantos dias faltam pro check-in:
+
+| Dias restantes até o check-in | Bucket |
+|---|---|
+| ≥ 21 | "21+ dias" |
+| 14 – 20 | "14 dias" |
+| 7 – 13 | "7 dias" |
+| 5 – 6 | "5 dias" |
+| 3 – 4 | "3 dias" |
+| 1 – 2 | "1 dia" |
+| 0 | "No dia" |
+
+**Dentro de cada bucket**, as sub-regras são **bandas de ocupação mutuamente exclusivas**. Exemplo do bucket "5 dias":
+
+| Ocupação | Ajuste |
+|---|---|
+| 0 – 40% | -10% |
+| 40 – 50% | -5% |
+| 50 – 60% | 0% (preço mantém) |
+| 60 – 100% | +10% |
+
+Sempre **exatamente uma** regra dispara por combinação (bucket × ocupação).
+
+**Com essa leitura, a palavra "Cumulativo" do PDF passa a significar:** `AjustePortfolio + AjusteIndividual` **somam** (cumulam entre as duas camadas) — consistente com a regra "Cancela 1" (AMB-01), que só faz sentido se as duas camadas cumularem por padrão.
+
+**Ambiguidade residual (pequena):** quando `AjustePortfolio` e `AjusteIndividual` têm **sinais opostos** (um manda subir, outro descer), o que prevalece? Soma algebricamente, prevalece o mais forte, ou cancela?
+
+**Impacto:** com a leitura refinada, o risco de espiral de desconto (RISC-01) fica **drasticamente reduzido** — o pior caso por camada é -10%, somando no máximo -20% entre port + ind (antes da mitigação de "Cancela 1").
 
 ### AMB-03 — Gap de 15–30 dias na antecedência
 As faixas definidas cobrem `0-15`, `30-90`, `90-180`, `180-365`. O intervalo `15-30` dias não está especificado. Assume-se 0%, mas precisa estar explícito.
@@ -115,9 +142,9 @@ O PDF lista feriado dentro de **Eventos**. Mas feriado é recorrente e previsív
 ## 5. Riscos identificados
 
 ### RISC-01 — Espiral de descontos
-Sem preço mínimo (floor) e com a ambiguidade AMB-02 resolvida como "cumulativo total", uma unidade em baixa ocupação pode receber -40% ou mais, destruindo margem.
+Com a leitura refinada de AMB-02 (bandas exclusivas por bucket), o desconto máximo por camada é **-10%**, e por somatório das duas camadas **-20%** no pior caso. Risco de espiral fica contido, mas sem preço mínimo (floor) ainda é possível chegar em preços abaixo de custo em temporadas ruins prolongadas.
 
-**Mitigação:** definir `preco_min` por unidade antes do launch.
+**Mitigação:** definir `preco_min` por unidade antes do launch + revisitar se a Cyclinn confirmar uma leitura diferente de "Cumulativo".
 
 ### RISC-02 — Preços absurdos em stacks de fatores
 Antecedência +35% combinada com evento forte (+50%) e sazonalidade alta (+25%) pode gerar preço 2× a 3× o Pb. Pode ser intencional, mas precisa de ceiling para casos patológicos.
@@ -147,10 +174,11 @@ Agrupei em blocos para facilitar a reunião.
 
 ### Bloco A — Semântica das regras (responde AMB-01 a AMB-03, AMB-08, AMB-09)
 1. O que "Cancela 1" significa exatamente?
-2. Em "Ocupação (Cumulativo)", cumulativo entre quais elementos?
-3. O que acontece com antecedência entre 15 e 30 dias?
-4. A composição `(1 + a + b + c + d)` é intencional, ou vocês queriam multiplicativa?
-5. Feriado é `evento` ou entra em `sazonalidade`/`dia da semana`?
+2. Confirmação da leitura refinada de AMB-02: as janelas de ocupação são **buckets mutuamente exclusivos por dias-até-check-in**, e dentro de cada bucket as bandas de ocupação também são mutuamente exclusivas (só uma regra dispara)? E "Cumulativo" se refere a `AjustePortfolio + AjusteIndividual`?
+3. Quando `AjustePortfolio` e `AjusteIndividual` têm sinais opostos (ex: port +10% vs ind -10%), o que acontece? Soma, cancela, prevalece o mais forte?
+4. O que acontece com antecedência entre 15 e 30 dias?
+5. A composição `(1 + a + b + c + d)` é intencional, ou vocês queriam multiplicativa?
+6. Feriado é `evento` ou entra em `sazonalidade`/`dia da semana`?
 
 ### Bloco B — Completude do algoritmo (responde AMB-04, AMB-05)
 6. Quais as regras de `AlteraçãoRelevante` para `Ant ≤ 180`?
@@ -202,7 +230,7 @@ Agrupei em blocos para facilitar a reunião.
 | 0–15 dias (qua) | +14% | |
 | 0–15 dias (sex, sáb, dom) | 0% | |
 
-### Ocupação individual (cumulativo — semântica ambígua, ver AMB-02)
+### Ocupação individual — tal como escrito no PDF
 | Janela | Regra |
 |---|---|
 | 21+ dias | > 30% → +10% |
@@ -212,3 +240,33 @@ Agrupei em blocos para facilitar a reunião.
 | 3 dias | < 50% → -10%; < 60% → -5%; > 70% → +10% |
 | 1 dia | < 65% → -10%; < 75% → -5%; > 85% → +10% |
 | No dia | < 70% → -10%; < 80% → -5%; > 90% → +10% |
+
+### Ocupação individual — reorganizada como bandas exclusivas (leitura de AMB-02)
+Cada dia cai em exatamente um bucket pela coluna "dias restantes"; dentro do bucket, a ocupação cai em exatamente uma banda.
+
+| Bucket (dias até check-in) | Banda de ocupação | Ajuste |
+|---|---|---|
+| **21+ dias** (≥ 21) | 0 – 30% | 0% |
+| | 30 – 100% | +10% |
+| **14 dias** (14 – 20) | 0 – 40% | 0% |
+| | 40 – 100% | +10% |
+| **7 dias** (7 – 13) | 0 – 30% | -10% |
+| | 30 – 40% | -5% |
+| | 40 – 50% | 0% |
+| | 50 – 100% | +10% |
+| **5 dias** (5 – 6) | 0 – 40% | -10% |
+| | 40 – 50% | -5% |
+| | 50 – 60% | 0% |
+| | 60 – 100% | +10% |
+| **3 dias** (3 – 4) | 0 – 50% | -10% |
+| | 50 – 60% | -5% |
+| | 60 – 70% | 0% |
+| | 70 – 100% | +10% |
+| **1 dia** (1 – 2) | 0 – 65% | -10% |
+| | 65 – 75% | -5% |
+| | 75 – 85% | 0% |
+| | 85 – 100% | +10% |
+| **No dia** (0) | 0 – 70% | -10% |
+| | 70 – 80% | -5% |
+| | 80 – 90% | 0% |
+| | 90 – 100% | +10% |

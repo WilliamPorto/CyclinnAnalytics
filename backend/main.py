@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data"
+SIMULADOR_DB = ROOT / "simulador" / "backend" / "simulador.duckdb"
+SIMULADOR_ALIAS = "simulador"  # catálogo anexado
 MAX_ROWS = 5000
 MAX_QUERY_MS = 15_000
 
@@ -36,7 +38,7 @@ app.add_middleware(
 
 
 def build_duckdb() -> duckdb.DuckDBPyConnection:
-    """Cria uma conexão DuckDB e registra cada parquet como view no schema."""
+    """Cria uma conexão DuckDB, registra parquets como views e anexa o simulador.duckdb."""
     con = duckdb.connect()
     if not DATA_ROOT.exists():
         raise RuntimeError(f"DATA_ROOT não existe: {DATA_ROOT}")
@@ -58,6 +60,14 @@ def build_duckdb() -> duckdb.DuckDBPyConnection:
                 f"""CREATE OR REPLACE VIEW "{schema}"."{table}" AS
                 SELECT * FROM read_parquet('{glob}')"""
             )
+
+    # Anexa o banco do simulador (se existir) como catálogo read-only
+    if SIMULADOR_DB.exists():
+        sim_path = str(SIMULADOR_DB).replace("'", "''")
+        con.execute(
+            f"ATTACH '{sim_path}' AS {SIMULADOR_ALIAS} (READ_ONLY)"
+        )
+
     return con
 
 
@@ -93,8 +103,10 @@ def health() -> dict:
 
 @app.get("/schemas")
 def list_schemas() -> dict:
-    """Lista schemas + tabelas + contagem de linhas."""
+    """Lista schemas + tabelas + contagem de linhas (default catalog + simulador anexado)."""
     result: dict[str, list[dict[str, Any]]] = {}
+
+    # Views do catálogo default (parquets em /data/)
     rows = CON.execute(
         """
         SELECT table_schema, table_name
@@ -107,24 +119,65 @@ def list_schemas() -> dict:
     for schema, table in rows:
         count = CON.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"').fetchone()[0]
         result.setdefault(schema, []).append({"table": table, "row_count": count})
+
+    # Tabelas do banco simulador anexado (se presente)
+    attached = CON.execute(
+        """
+        SELECT table_name
+        FROM duckdb_tables()
+        WHERE database_name = ? AND NOT internal
+        ORDER BY table_name
+        """,
+        [SIMULADOR_ALIAS],
+    ).fetchall()
+    for (table,) in attached:
+        count = CON.execute(
+            f'SELECT COUNT(*) FROM {SIMULADOR_ALIAS}.main."{table}"'
+        ).fetchone()[0]
+        result.setdefault(SIMULADOR_ALIAS, []).append(
+            {"table": table, "row_count": count}
+        )
+
     return result
 
 
 @app.get("/schemas/{schema}/tables/{table}")
 def describe_table(schema: str, table: str) -> TableInfo:
     try:
-        cols = CON.execute(
-            """
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = ? AND table_name = ?
-            ORDER BY ordinal_position
-            """,
-            [schema, table],
-        ).fetchall()
-        if not cols:
-            raise HTTPException(status_code=404, detail=f"{schema}.{table} não encontrado")
-        count = CON.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"').fetchone()[0]
+        if schema == SIMULADOR_ALIAS:
+            cols = CON.execute(
+                """
+                SELECT column_name, data_type
+                FROM duckdb_columns()
+                WHERE database_name = ? AND table_name = ?
+                ORDER BY column_index
+                """,
+                [SIMULADOR_ALIAS, table],
+            ).fetchall()
+            if not cols:
+                raise HTTPException(
+                    status_code=404, detail=f"{schema}.{table} não encontrado"
+                )
+            count = CON.execute(
+                f'SELECT COUNT(*) FROM {SIMULADOR_ALIAS}.main."{table}"'
+            ).fetchone()[0]
+        else:
+            cols = CON.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = ? AND table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [schema, table],
+            ).fetchall()
+            if not cols:
+                raise HTTPException(
+                    status_code=404, detail=f"{schema}.{table} não encontrado"
+                )
+            count = CON.execute(
+                f'SELECT COUNT(*) FROM "{schema}"."{table}"'
+            ).fetchone()[0]
     except duckdb.Error as e:
         raise HTTPException(status_code=400, detail=str(e))
     return TableInfo(

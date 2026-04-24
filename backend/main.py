@@ -1303,6 +1303,190 @@ def toggle_ativo_faixa_antecedencia(lead_min: int, lead_max: int, body: AtivoAnt
     return {"ok": True, "linhas_afetadas": int(mask.sum())}
 
 
+# ─── Ocupação (portfólio) ─────────────────────────────────────
+
+OCUP_PORTFOLIO_PARQUET = (
+    DATA_ROOT / "regras_posteriori" / "regras_ocupacao_portfolio" / "regras_ocupacao_portfolio.parquet"
+)
+
+
+def _read_ocup_portfolio_df() -> pd.DataFrame:
+    if not OCUP_PORTFOLIO_PARQUET.exists():
+        return pd.DataFrame(
+            columns=[
+                "regra_id", "escopo", "escopo_id",
+                "janela_dias", "ocupacao_min_pct", "ocupacao_max_pct",
+                "ajuste_pct", "cumulativo", "ativo",
+            ]
+        )
+    df = pd.read_parquet(OCUP_PORTFOLIO_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_ocup_portfolio_df(df: pd.DataFrame) -> None:
+    OCUP_PORTFOLIO_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["regra_id"] = df["regra_id"].astype("int64")
+        df["escopo_id"] = df["escopo_id"].astype("Int64")
+        df["janela_dias"] = df["janela_dias"].astype("int64")
+        df["ocupacao_min_pct"] = df["ocupacao_min_pct"].astype(float)
+        df["ocupacao_max_pct"] = df["ocupacao_max_pct"].astype(float)
+        df["ajuste_pct"] = df["ajuste_pct"].astype(float)
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(OCUP_PORTFOLIO_PARQUET, index=False)
+
+
+def _serializar_buckets_ocup(df: pd.DataFrame) -> list[dict]:
+    buckets: list[dict] = []
+    for janela, g in df.groupby("janela_dias"):
+        g = g.sort_values("ocupacao_min_pct")
+        bandas = [
+            {
+                "ocupacao_min_pct": float(r["ocupacao_min_pct"]),
+                "ocupacao_max_pct": float(r["ocupacao_max_pct"]),
+                "ajuste_pct": float(r["ajuste_pct"]),
+            }
+            for _, r in g.iterrows()
+        ]
+        buckets.append(
+            {
+                "janela_dias": int(janela),
+                "bandas": bandas,
+                "ativo": bool(g["ativo"].all()),
+            }
+        )
+    buckets.sort(key=lambda b: b["janela_dias"])
+    return buckets
+
+
+@app.get("/regras/ocupacao-portfolio")
+def listar_ocupacao_portfolio(incluir_inativos: bool = True) -> dict:
+    df = _read_ocup_portfolio_df()
+    if not incluir_inativos:
+        df = df[df["ativo"]]
+    if df.empty:
+        return {"buckets": []}
+    return {"buckets": _serializar_buckets_ocup(df)}
+
+
+class BucketOcupIn(BaseModel):
+    janela_dias: int = Field(..., ge=0, le=365)
+    limites: list[float] = Field(default_factory=list)  # ordenados, todos em (0, 1)
+    ajustes: list[float]  # len = limites.len + 1
+
+
+def _validar_bucket_ocup(body: BucketOcupIn) -> None:
+    if body.janela_dias < 0:
+        raise HTTPException(status_code=400, detail="janela_dias inválida")
+    if len(body.ajustes) != len(body.limites) + 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ajustes deve ter {len(body.limites) + 1} itens (limites + 1)",
+        )
+    for i, lim in enumerate(body.limites):
+        if not (0.0 < lim < 1.0):
+            raise HTTPException(status_code=400, detail=f"limite {lim} fora de (0, 1)")
+        if i > 0 and lim <= body.limites[i - 1]:
+            raise HTTPException(status_code=400, detail="limites precisam ser estritamente crescentes")
+    for a in body.ajustes:
+        if not (-1.0 <= a <= 3.0):
+            raise HTTPException(status_code=400, detail="ajuste fora de [-100%, +300%]")
+
+
+def _bucket_para_linhas(body: BucketOcupIn, start_id: int) -> list[dict]:
+    """Converte (janela, limites, ajustes) em linhas de banda."""
+    pontos = [0.0] + list(body.limites) + [1.0]
+    linhas = []
+    next_id = start_id
+    for i, adj in enumerate(body.ajustes):
+        linhas.append(
+            {
+                "regra_id": next_id,
+                "escopo": "global",
+                "escopo_id": None,
+                "janela_dias": body.janela_dias,
+                "ocupacao_min_pct": pontos[i],
+                "ocupacao_max_pct": pontos[i + 1],
+                "ajuste_pct": float(adj),
+                "cumulativo": True,
+                "ativo": True,
+            }
+        )
+        next_id += 1
+    return linhas
+
+
+@app.post("/regras/ocupacao-portfolio/bucket", status_code=201)
+def criar_bucket_ocup(body: BucketOcupIn) -> dict:
+    _validar_bucket_ocup(body)
+    df = _read_ocup_portfolio_df()
+    if (df["janela_dias"] == body.janela_dias).any():
+        raise HTTPException(status_code=409, detail=f"Bucket {body.janela_dias} já existe")
+    next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+    linhas = _bucket_para_linhas(body, next_id)
+    df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
+    _write_ocup_portfolio_df(df)
+    return {"ok": True}
+
+
+@app.put("/regras/ocupacao-portfolio/bucket/{janela_dias}")
+def atualizar_bucket_ocup(janela_dias: int, body: BucketOcupIn) -> dict:
+    _validar_bucket_ocup(body)
+    if body.janela_dias != janela_dias:
+        # Permitir renomear janela: remove a antiga e grava a nova
+        df = _read_ocup_portfolio_df()
+        if not (df["janela_dias"] == janela_dias).any():
+            raise HTTPException(status_code=404, detail="Bucket não encontrado")
+        if (df["janela_dias"] == body.janela_dias).any():
+            raise HTTPException(status_code=409, detail=f"Bucket {body.janela_dias} já existe")
+        df = df[df["janela_dias"] != janela_dias].copy()
+        next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+        linhas = _bucket_para_linhas(body, next_id)
+        df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
+        _write_ocup_portfolio_df(df)
+        return {"ok": True}
+
+    df = _read_ocup_portfolio_df()
+    mask = df["janela_dias"] == janela_dias
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Bucket não encontrado")
+    df = df[~mask].copy()
+    next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+    linhas = _bucket_para_linhas(body, next_id)
+    df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
+    _write_ocup_portfolio_df(df)
+    return {"ok": True}
+
+
+class AtivoOcupPatch(BaseModel):
+    ativo: bool
+
+
+@app.patch("/regras/ocupacao-portfolio/bucket/{janela_dias}/ativo")
+def toggle_ativo_bucket_ocup(janela_dias: int, body: AtivoOcupPatch) -> dict:
+    df = _read_ocup_portfolio_df()
+    mask = df["janela_dias"] == janela_dias
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Bucket não encontrado")
+    df.loc[mask, "ativo"] = body.ativo
+    _write_ocup_portfolio_df(df)
+    return {"ok": True, "linhas_afetadas": int(mask.sum())}
+
+
+@app.delete("/regras/ocupacao-portfolio/bucket/{janela_dias}")
+def deletar_bucket_ocup(janela_dias: int) -> dict:
+    df = _read_ocup_portfolio_df()
+    mask = df["janela_dias"] == janela_dias
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Bucket não encontrado")
+    df = df[~mask].copy()
+    _write_ocup_portfolio_df(df)
+    return {"ok": True}
+
+
 @app.post("/regras/rebuild-simulador")
 def rebuild_simulador() -> dict:
     """Regenera o simulador.duckdb a partir dos parquets atualizados."""

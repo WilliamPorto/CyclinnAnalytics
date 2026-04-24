@@ -35,23 +35,28 @@ function resumoFaixa(f: Faixa): string {
   return `${fmtPct(f.ajuste_uniforme ?? 0)} (todos os dias)`;
 }
 
-// Cor do segmento na timeline (gradiente por intensidade do ajuste)
+// Cor do segmento na timeline — paleta pastel (verde p/ aumento, rosado p/ redução)
 function segColor(ajuste: number): string {
-  if (Math.abs(ajuste) < 0.001) return "#f1f5f9";
+  if (Math.abs(ajuste) < 0.001) return "#f8fafc";
   if (ajuste > 0) {
-    // Verde -> azul escuro conforme cresce
+    // green-50 (#f0fdf4) → green-300 (#86efac)
     const t = Math.min(1, ajuste / 0.5);
-    const r = Math.round(186 - (186 - 29) * t);
-    const g = Math.round(230 - (230 - 78) * t);
-    const b = Math.round(253 - (253 - 216) * t);
+    const r = Math.round(240 - (240 - 134) * t);
+    const g = Math.round(253 - (253 - 239) * t);
+    const b = Math.round(244 - (244 - 172) * t);
     return `rgb(${r},${g},${b})`;
   }
-  // Vermelho
+  // red-50 (#fef2f2) → red-300 (#fca5a5)
   const t = Math.min(1, -ajuste / 0.3);
-  const r = Math.round(254 - (254 - 220) * t);
-  const g = Math.round(226 - (226 - 38) * t);
-  const b = Math.round(226 - (226 - 38) * t);
+  const r = Math.round(254 - (254 - 252) * t);
+  const g = Math.round(242 - (242 - 165) * t);
+  const b = Math.round(242 - (242 - 165) * t);
   return `rgb(${r},${g},${b})`;
+}
+
+// Texto sobre o segmento: sempre escuro, já que a paleta é toda pastel
+function textOnSeg(_ajuste: number): string {
+  return "#0f172a";
 }
 
 export default function AntecedenciaTab() {
@@ -187,14 +192,11 @@ export default function AntecedenciaTab() {
 
       <div style={{ flex: 1, overflow: "auto", padding: 20 }}>
         <div style={{ maxWidth: 900, margin: "0 auto" }}>
-          {/* Timeline visual */}
-          <Timeline faixas={faixas.filter((f) => f.ativo)} gaps={gaps} />
-
-          {loading && <div style={{ color: "#64748b", marginTop: 14 }}>carregando…</div>}
-          {error && <div style={{ color: "#dc2626", marginTop: 14 }}>{error}</div>}
+          {loading && <div style={{ color: "#64748b" }}>carregando…</div>}
+          {error && <div style={{ color: "#dc2626" }}>{error}</div>}
 
           {/* Cards de faixas + gaps */}
-          <div style={{ marginTop: 18, display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {combinarFaixasEGaps(faixas, gaps).map((item) => {
               if (item.tipo === "gap") {
                 const g = item.gap;
@@ -247,6 +249,11 @@ export default function AntecedenciaTab() {
             )}
           </div>
 
+          {/* Timeline visual — abaixo dos cards */}
+          <div style={{ marginTop: 32 }}>
+            <Timeline faixas={faixas.filter((f) => f.ativo)} gaps={gaps} />
+          </div>
+
           <div style={{ marginTop: 24, fontSize: 11, color: "#64748b", lineHeight: 1.5 }}>
             <strong>Como funciona:</strong> para uma diária com N dias até o check-in, o
             motor aplica a regra da faixa onde N cai. Só uma faixa aplica por vez
@@ -280,6 +287,7 @@ function Timeline({ faixas, gaps }: { faixas: Faixa[]; gaps: Gap[] }) {
       label: string;
       tone: "faixa" | "gap";
       ajuste?: number;
+      porDow?: boolean;
     }> = [];
     for (const f of faixas) {
       const ajuste =
@@ -289,11 +297,10 @@ function Timeline({ faixas, gaps }: { faixas: Faixa[]; gaps: Gap[] }) {
       segs.push({
         mn: f.lead_min_dias,
         mx: f.lead_max_dias,
-        label: f.por_dow
-          ? "varia"
-          : fmtPct(f.ajuste_uniforme ?? 0),
+        label: f.por_dow ? "varia" : fmtPct(f.ajuste_uniforme ?? 0),
         tone: "faixa",
         ajuste,
+        porDow: f.por_dow,
       });
     }
     for (const g of gaps) {
@@ -303,15 +310,109 @@ function Timeline({ faixas, gaps }: { faixas: Faixa[]; gaps: Gap[] }) {
     return segs;
   }, [faixas, gaps]);
 
+  // Marcadores na régua: inclui bordas das faixas/gaps + marcadores principais
+  const bordas = useMemo(() => {
+    const s = new Set<number>([0, HORIZONTE]);
+    for (const seg of segments) {
+      s.add(seg.mn);
+      s.add(seg.mx);
+    }
+    return Array.from(s).sort((a, b) => a - b);
+  }, [segments]);
+
   return (
-    <div>
-      <div style={{ fontSize: 11, letterSpacing: 0.5, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-        Linha do tempo — dias até o check-in
+    <div
+      style={{
+        background: "#ffffff",
+        border: "1px solid #e2e8f0",
+        borderRadius: 12,
+        padding: 20,
+        boxShadow: "0 1px 2px rgba(15,23,42,0.04), 0 4px 14px rgba(15,23,42,0.04)",
+      }}
+    >
+      {/* Título e legenda */}
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontSize: 11, letterSpacing: 0.5, color: "#64748b", fontWeight: 700, textTransform: "uppercase" }}>
+            Linha do tempo
+          </div>
+          <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>
+            dias entre a reserva e o check-in
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 14, fontSize: 10, color: "#64748b", alignItems: "center" }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span style={{ display: "inline-block", width: 14, height: 10, borderRadius: 3, background: segColor(0.05), border: "1px solid rgba(0,0,0,0.04)" }} />
+            aumento
+          </span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span style={{ display: "inline-block", width: 14, height: 10, borderRadius: 3, background: segColor(0.35), border: "1px solid rgba(0,0,0,0.04)" }} />
+            aumento forte
+          </span>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span
+              style={{
+                display: "inline-block",
+                width: 14,
+                height: 10,
+                borderRadius: 3,
+                backgroundImage:
+                  "repeating-linear-gradient(45deg, #f1f5f9, #f1f5f9 3px, #e2e8f0 3px, #e2e8f0 6px)",
+                border: "1px solid #cbd5e1",
+              }}
+            />
+            gap
+          </span>
+        </div>
       </div>
-      <div style={{ position: "relative", display: "flex", height: 56, border: "1px solid #e2e8f0", borderRadius: 6, overflow: "hidden", background: "#f8fafc" }}>
+
+      {/* Marcadores "hoje" e "longe" */}
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 10, fontWeight: 600, color: "#475569", letterSpacing: 0.3, textTransform: "uppercase" }}>
+        <span>🟢 check-in</span>
+        <span>{HORIZONTE} dias antes</span>
+      </div>
+
+      {/* Barra principal */}
+      <div
+        style={{
+          position: "relative",
+          display: "flex",
+          height: 74,
+          border: "1px solid #e2e8f0",
+          borderRadius: 10,
+          overflow: "hidden",
+          background: "#f8fafc",
+        }}
+      >
         {segments.map((s, i) => {
           const width = ((s.mx - s.mn) / HORIZONTE) * 100;
-          const bg = s.tone === "gap" ? "#e2e8f0" : segColor(s.ajuste ?? 0);
+          if (s.tone === "gap") {
+            return (
+              <div
+                key={i}
+                title={`${s.mn} – ${s.mx} dias · sem regra`}
+                style={{
+                  flex: `0 0 ${width}%`,
+                  backgroundImage:
+                    "repeating-linear-gradient(45deg, #f1f5f9, #f1f5f9 6px, #e2e8f0 6px, #e2e8f0 12px)",
+                  borderRight: i < segments.length - 1 ? "1px dashed #cbd5e1" : 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  color: "#94a3b8",
+                  textTransform: "uppercase",
+                  letterSpacing: 0.5,
+                  minWidth: 0,
+                }}
+              >
+                {width > 6 && "gap"}
+              </div>
+            );
+          }
+          const bg = segColor(s.ajuste ?? 0);
+          const fg = textOnSeg(s.ajuste ?? 0);
           return (
             <div
               key={i}
@@ -319,25 +420,38 @@ function Timeline({ faixas, gaps }: { faixas: Faixa[]; gaps: Gap[] }) {
               style={{
                 flex: `0 0 ${width}%`,
                 background: bg,
-                borderRight: "1px solid rgba(0,0,0,0.06)",
+                borderRight: i < segments.length - 1 ? "1px solid rgba(15,23,42,0.08)" : 0,
                 display: "flex",
+                flexDirection: "column",
                 alignItems: "center",
                 justifyContent: "center",
-                fontSize: 11,
-                fontWeight: 600,
-                color: s.tone === "gap" ? "#64748b" : "#0f172a",
+                gap: 3,
+                color: fg,
                 position: "relative",
                 minWidth: 0,
+                padding: "0 6px",
               }}
             >
-              {width > 6 && s.label}
+              {width > 4 && (
+                <>
+                  <div style={{ fontSize: width > 10 ? 18 : 13, fontWeight: 700, letterSpacing: -0.3 }}>
+                    {s.label}
+                  </div>
+                  {width > 7 && (
+                    <div style={{ fontSize: 10, fontWeight: 500, opacity: 0.85, textTransform: "uppercase", letterSpacing: 0.3 }}>
+                      {s.mn}–{s.mx}d{s.porDow ? " · por dia" : ""}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           );
         })}
       </div>
-      {/* Régua de dias */}
-      <div style={{ position: "relative", height: 18, marginTop: 2 }}>
-        {[0, 15, 30, 90, 180, 365].map((d) => {
+
+      {/* Régua de dias — todos os pontos de fronteira */}
+      <div style={{ position: "relative", height: 22, marginTop: 4 }}>
+        {bordas.map((d) => {
           const pct = (d / HORIZONTE) * 100;
           return (
             <div
@@ -345,13 +459,25 @@ function Timeline({ faixas, gaps }: { faixas: Faixa[]; gaps: Gap[] }) {
               style={{
                 position: "absolute",
                 left: `${pct}%`,
-                transform: d === 0 ? "none" : d === 365 ? "translateX(-100%)" : "translateX(-50%)",
-                fontSize: 10,
-                color: "#64748b",
-                fontVariantNumeric: "tabular-nums",
+                transform:
+                  d === 0 ? "translateX(-0%)" : d === HORIZONTE ? "translateX(-100%)" : "translateX(-50%)",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: d === 0 ? "flex-start" : d === HORIZONTE ? "flex-end" : "center",
+                gap: 2,
               }}
             >
-              {d}d
+              <span style={{ width: 1, height: 5, background: "#cbd5e1" }} />
+              <span
+                style={{
+                  fontSize: 10,
+                  color: "#64748b",
+                  fontVariantNumeric: "tabular-nums",
+                  fontWeight: 500,
+                }}
+              >
+                {d}d
+              </span>
             </div>
           );
         })}

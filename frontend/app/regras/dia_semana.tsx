@@ -21,19 +21,20 @@ function fmtPct(v: number): string {
   return `${p > 0 ? "+" : ""}${Number.isInteger(p) ? p.toFixed(0) : p.toFixed(1)}%`;
 }
 
-// Heatmap diverging: vermelho ← branco → verde
+// Heatmap diverging pastel: vermelho ← branco → verde
+// green-50 (#f0fdf4) → green-300 (#86efac) e red-50 (#fef2f2) → red-300 (#fca5a5)
 function cellColor(v: number, vabs: number): string {
   if (Math.abs(v) < 0.001) return "#ffffff";
   const t = vabs === 0 ? 0 : Math.min(1, Math.abs(v) / vabs);
   if (v > 0) {
-    const r = Math.round(220 - (220 - 22) * t);
-    const g = Math.round(252 - (252 - 163) * t);
-    const b = Math.round(231 - (231 - 74) * t);
+    const r = Math.round(240 - (240 - 134) * t);
+    const g = Math.round(253 - (253 - 239) * t);
+    const b = Math.round(244 - (244 - 172) * t);
     return `rgb(${r},${g},${b})`;
   }
-  const r = Math.round(254 - (254 - 220) * t);
-  const g = Math.round(226 - (226 - 38) * t);
-  const b = Math.round(226 - (226 - 38) * t);
+  const r = Math.round(254 - (254 - 252) * t);
+  const g = Math.round(242 - (242 - 165) * t);
+  const b = Math.round(242 - (242 - 165) * t);
   return `rgb(${r},${g},${b})`;
 }
 

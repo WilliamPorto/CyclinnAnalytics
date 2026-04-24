@@ -5,12 +5,14 @@ import SazonalidadeTab from "./sazonalidade";
 import DiaSemanaTab from "./dia_semana";
 import EventosTab from "./eventos";
 import AntecedenciaTab from "./antecedencia";
+import OcupacaoTab from "./ocupacao";
 
 const SUB_TABS: { key: string; label: string; enabled: boolean }[] = [
   { key: "sazonalidade", label: "Sazonalidade", enabled: true },
   { key: "dia_semana", label: "Dia da semana", enabled: true },
   { key: "eventos", label: "Eventos", enabled: true },
   { key: "antecedencia", label: "Antecedência", enabled: true },
+  { key: "ocupacao", label: "Ocupação", enabled: true },
 ];
 
 export default function RegrasPage() {
@@ -59,6 +61,7 @@ export default function RegrasPage() {
         {activeTab === "dia_semana" && <DiaSemanaTab />}
         {activeTab === "eventos" && <EventosTab />}
         {activeTab === "antecedencia" && <AntecedenciaTab />}
+        {activeTab === "ocupacao" && <OcupacaoTab />}
       </div>
     </main>
   );

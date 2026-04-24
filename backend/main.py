@@ -11,12 +11,15 @@ Execução:
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import duckdb
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -258,6 +261,8 @@ SIMULADOR_TABLES: dict[str, tuple[str, str, str]] = {
     "d":                     ("valor",                  "currency", "unidade"),
     "ocupacao_portfolio":    ("ocupacao_pct",           "percent",  "portfolio"),
     "expectativa_portfolio": ("ocupacao_esperada_pct",  "percent",  "portfolio"),
+    # Tabela virtual: gap = real − esperada (calculado no endpoint)
+    "gap_ocupacao":          ("gap_pct",                "percent",  "portfolio"),
 }
 
 
@@ -290,11 +295,16 @@ def simulador_matrix(
     data_fim: str,
     page: int = 1,
     page_size: int = 25,
+    view: str = "unidade",  # "unidade" | "portfolio"
 ) -> dict:
     if table not in SIMULADOR_TABLES:
         raise HTTPException(status_code=404, detail=f"Tabela '{table}' não suportada")
+    if view not in ("unidade", "portfolio"):
+        raise HTTPException(status_code=400, detail=f"view inválido: {view}")
 
-    value_col, fmt, row_type = SIMULADOR_TABLES[table]
+    value_col, fmt, native_row_type = SIMULADOR_TABLES[table]
+    # Para tabelas que já são nativamente por portfólio, ignoramos "view".
+    effective_row_type = native_row_type if native_row_type == "portfolio" else view
 
     try:
         d_ref = date.fromisoformat(data_referencia)
@@ -310,8 +320,8 @@ def simulador_matrix(
     page_size = max(1, min(200, int(page_size)))
     offset = (page - 1) * page_size
 
-    # Linhas da página + total (unidades ou regiões)
-    if row_type == "unidade":
+    # Labels (unidades × codigo_externo) ou (regioes × nome)
+    if effective_row_type == "unidade":
         total = CON.execute("SELECT COUNT(*) FROM cadastro.unidades").fetchone()[0]
         label_rows = CON.execute(
             f"""
@@ -321,7 +331,6 @@ def simulador_matrix(
             LIMIT {page_size} OFFSET {offset}
             """
         ).fetchall()
-        key_col = "unidade_id"
     else:
         total = CON.execute("SELECT COUNT(*) FROM cadastro.regioes").fetchone()[0]
         label_rows = CON.execute(
@@ -332,31 +341,65 @@ def simulador_matrix(
             LIMIT {page_size} OFFSET {offset}
             """
         ).fetchall()
-        key_col = "portfolio_id"
 
     ids = [r[0] for r in label_rows]
     labels = {r[0]: r[1] for r in label_rows}
 
-    # Colunas de data
     date_cols: list[str] = []
     cur = d_ini
     while cur <= d_fim:
         date_cols.append(cur.isoformat())
         cur += timedelta(days=1)
 
-    # Valores (apenas linhas da página)
+    d_ref_s = d_ref.isoformat()
+    d_ini_s = d_ini.isoformat()
+    d_fim_s = d_fim.isoformat()
+
+    needs_aggregation = effective_row_type == "portfolio" and native_row_type == "unidade"
+
+    def build_values_sql(ids_filter: str) -> str:
+        # Tabela virtual gap_ocupacao = real − esperada (já por portfólio)
+        if table == "gap_ocupacao":
+            return f"""
+                SELECT o.portfolio_id AS id, o.data,
+                       (o.ocupacao_pct - e.ocupacao_esperada_pct) AS v
+                FROM {SIMULADOR_ALIAS}.main.ocupacao_portfolio o
+                JOIN {SIMULADOR_ALIAS}.main.expectativa_portfolio e
+                  USING(data_referencia, portfolio_id, data)
+                WHERE o.data_referencia = DATE '{d_ref_s}'
+                  AND o.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                  {ids_filter.replace('portfolio_id', 'o.portfolio_id')}
+            """
+        if not needs_aggregation:
+            key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
+            return f"""
+                SELECT {key_col} AS id, data, {value_col} AS v
+                FROM {SIMULADOR_ALIAS}.main.{table}
+                WHERE data_referencia = DATE '{d_ref_s}'
+                  AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                  {ids_filter}
+            """
+        # Agrega por região (média simples)
+        return f"""
+            SELECT p.regiao_id AS id, t.data, AVG(t.{value_col}) AS v
+            FROM {SIMULADOR_ALIAS}.main.{table} t
+            JOIN cadastro.unidades u ON u.unidade_id = t.unidade_id
+            JOIN cadastro.predios p USING(predio_id)
+            WHERE t.data_referencia = DATE '{d_ref_s}'
+              AND t.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+              {ids_filter}
+            GROUP BY p.regiao_id, t.data
+        """
+
     matrix_rows: list[dict] = []
     if ids:
         ids_list = ",".join(str(i) for i in ids)
-        values_rows = CON.execute(
-            f"""
-            SELECT {key_col} AS id, data, {value_col} AS v
-            FROM {SIMULADOR_ALIAS}.main.{table}
-            WHERE data_referencia = DATE '{d_ref.isoformat()}'
-              AND data BETWEEN DATE '{d_ini.isoformat()}' AND DATE '{d_fim.isoformat()}'
-              AND {key_col} IN ({ids_list})
-            """
-        ).fetchall()
+        if needs_aggregation:
+            ids_filter = f"AND p.regiao_id IN ({ids_list})"
+        else:
+            key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
+            ids_filter = f"AND {key_col} IN ({ids_list})"
+        values_rows = CON.execute(build_values_sql(ids_filter)).fetchall()
         lookup: dict[tuple[int, str], Any] = {}
         for rid, dt, v in values_rows:
             lookup[(rid, dt.isoformat())] = v
@@ -364,14 +407,9 @@ def simulador_matrix(
             vals = [lookup.get((rid, d)) for d in date_cols]
             matrix_rows.append({"id": rid, "label": labels[rid], "values": vals})
 
-    # Min/max globais (considerando TODAS as linhas no período — não só a página)
+    # Min/max global no período (para heatmap consistente entre páginas)
     stats = CON.execute(
-        f"""
-        SELECT MIN({value_col}), MAX({value_col})
-        FROM {SIMULADOR_ALIAS}.main.{table}
-        WHERE data_referencia = DATE '{d_ref.isoformat()}'
-          AND data BETWEEN DATE '{d_ini.isoformat()}' AND DATE '{d_fim.isoformat()}'
-        """
+        f"SELECT MIN(v), MAX(v) FROM ({build_values_sql('')}) q"
     ).fetchone()
     vmin = float(stats[0]) if stats[0] is not None else 0.0
     vmax = float(stats[1]) if stats[1] is not None else 0.0
@@ -382,7 +420,9 @@ def simulador_matrix(
         "data_inicio": data_inicio,
         "data_fim": data_fim,
         "format": fmt,
-        "row_type": row_type,
+        "row_type": effective_row_type,
+        "view": view,
+        "aggregated": needs_aggregation,
         "columns": date_cols,
         "rows": matrix_rows,
         "total_rows": total,
@@ -390,6 +430,256 @@ def simulador_matrix(
         "page_size": page_size,
         "min": vmin,
         "max": vmax,
+    }
+
+
+# ============================================================
+# Regras — CRUD de sazonalidade (grava no parquet direto)
+# ============================================================
+
+SAZONALIDADE_PARQUET = (
+    DATA_ROOT / "regras_priori" / "regras_sazonalidade" / "regras_sazonalidade.parquet"
+)
+SIMULADOR_BUILD_SCRIPT = ROOT / "simulador" / "backend" / "build_simulator_db.py"
+
+
+def _read_sazonalidade_df() -> pd.DataFrame:
+    if not SAZONALIDADE_PARQUET.exists():
+        # Schema inicial vazio
+        return pd.DataFrame(
+            columns=[
+                "regra_id", "escopo", "escopo_id", "nome",
+                "data_inicio", "data_fim", "ajuste_pct",
+                "recorrente_anual", "prioridade", "ativo",
+            ]
+        )
+    df = pd.read_parquet(SAZONALIDADE_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_sazonalidade_df(df: pd.DataFrame) -> None:
+    SAZONALIDADE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    # Normaliza tipos antes de salvar
+    if not df.empty:
+        df = df.copy()
+        df["data_inicio"] = pd.to_datetime(df["data_inicio"]).dt.date
+        df["data_fim"] = pd.to_datetime(df["data_fim"]).dt.date
+        df["escopo_id"] = df["escopo_id"].astype("Int64")
+        df["regra_id"] = df["regra_id"].astype("int64")
+        df["ajuste_pct"] = df["ajuste_pct"].astype(float)
+        df["prioridade"] = df["prioridade"].astype("int64")
+        df["recorrente_anual"] = df["recorrente_anual"].astype(bool)
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(SAZONALIDADE_PARQUET, index=False)
+
+
+def _serialize_regra(row: pd.Series) -> dict:
+    def iso(v: Any) -> Optional[str]:
+        if pd.isna(v):
+            return None
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+
+    return {
+        "regra_id": int(row["regra_id"]),
+        "escopo": row["escopo"],
+        "escopo_id": (None if pd.isna(row["escopo_id"]) else int(row["escopo_id"])),
+        "nome": row["nome"],
+        "data_inicio": iso(row["data_inicio"]),
+        "data_fim": iso(row["data_fim"]),
+        "ajuste_pct": float(row["ajuste_pct"]),
+        "recorrente_anual": bool(row["recorrente_anual"]),
+        "prioridade": int(row["prioridade"]),
+        "ativo": bool(row["ativo"]),
+    }
+
+
+class SazonalidadeIn(BaseModel):
+    nome: str = Field(..., min_length=1, max_length=120)
+    data_inicio: str
+    data_fim: str
+    ajuste_pct: float = Field(..., ge=-1.0, le=3.0)
+    escopo: str = Field(..., pattern="^(global|regiao|predio|segmento|unidade)$")
+    escopo_id: Optional[int] = None
+    recorrente_anual: bool = True
+    prioridade: int = 10
+
+
+class SazonalidadePatch(BaseModel):
+    nome: Optional[str] = None
+    data_inicio: Optional[str] = None
+    data_fim: Optional[str] = None
+    ajuste_pct: Optional[float] = None
+    escopo: Optional[str] = None
+    escopo_id: Optional[int] = None
+    recorrente_anual: Optional[bool] = None
+    prioridade: Optional[int] = None
+    ativo: Optional[bool] = None
+
+
+def _validar_datas(d_ini_s: str, d_fim_s: str) -> tuple[date, date]:
+    try:
+        d_ini = date.fromisoformat(d_ini_s)
+        d_fim = date.fromisoformat(d_fim_s)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Data inválida: {e}")
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="data_fim anterior a data_inicio")
+    return d_ini, d_fim
+
+
+def _validar_escopo(escopo: str, escopo_id: Optional[int]) -> None:
+    if escopo == "global":
+        if escopo_id is not None:
+            raise HTTPException(status_code=400, detail="escopo global não deve ter escopo_id")
+        return
+    if escopo_id is None:
+        raise HTTPException(
+            status_code=400, detail=f"escopo '{escopo}' requer escopo_id"
+        )
+    # Valida se o escopo_id existe no catálogo
+    table_map = {
+        "regiao": "cadastro.regioes",
+        "predio": "cadastro.predios",
+        "segmento": "cadastro.segmentos",
+        "unidade": "cadastro.unidades",
+    }
+    col_map = {
+        "regiao": "regiao_id",
+        "predio": "predio_id",
+        "segmento": "segmento_id",
+        "unidade": "unidade_id",
+    }
+    t = table_map[escopo]
+    c = col_map[escopo]
+    exists = CON.execute(f"SELECT COUNT(*) FROM {t} WHERE {c} = ?", [escopo_id]).fetchone()[0]
+    if not exists:
+        raise HTTPException(
+            status_code=400, detail=f"{escopo}_id={escopo_id} não encontrado"
+        )
+
+
+@app.get("/regras/sazonalidade")
+def listar_sazonalidade(incluir_inativas: bool = True) -> list[dict]:
+    df = _read_sazonalidade_df()
+    if not incluir_inativas:
+        df = df[df["ativo"]]
+    df = df.sort_values(["ativo", "data_inicio"], ascending=[False, True])
+    return [_serialize_regra(r) for _, r in df.iterrows()]
+
+
+@app.post("/regras/sazonalidade", status_code=201)
+def criar_sazonalidade(body: SazonalidadeIn) -> dict:
+    d_ini, d_fim = _validar_datas(body.data_inicio, body.data_fim)
+    _validar_escopo(body.escopo, body.escopo_id)
+
+    df = _read_sazonalidade_df()
+    next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+
+    nova = {
+        "regra_id": next_id,
+        "escopo": body.escopo,
+        "escopo_id": body.escopo_id,
+        "nome": body.nome,
+        "data_inicio": d_ini,
+        "data_fim": d_fim,
+        "ajuste_pct": body.ajuste_pct,
+        "recorrente_anual": body.recorrente_anual,
+        "prioridade": body.prioridade,
+        "ativo": True,
+    }
+    df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+    _write_sazonalidade_df(df)
+    return _serialize_regra(pd.Series(nova))
+
+
+@app.patch("/regras/sazonalidade/{regra_id}")
+def editar_sazonalidade(regra_id: int, body: SazonalidadePatch) -> dict:
+    df = _read_sazonalidade_df()
+    mask = df["regra_id"] == regra_id
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"regra {regra_id} não encontrada")
+
+    patch_dict = body.model_dump(exclude_none=True)
+
+    if "data_inicio" in patch_dict or "data_fim" in patch_dict:
+        row = df[mask].iloc[0]
+        d_ini_s = patch_dict.get("data_inicio") or str(row["data_inicio"])
+        d_fim_s = patch_dict.get("data_fim") or str(row["data_fim"])
+        d_ini, d_fim = _validar_datas(d_ini_s, d_fim_s)
+        patch_dict["data_inicio"] = d_ini
+        patch_dict["data_fim"] = d_fim
+
+    if "escopo" in patch_dict or "escopo_id" in patch_dict:
+        row = df[mask].iloc[0]
+        escopo = patch_dict.get("escopo") or row["escopo"]
+        escopo_id = patch_dict.get("escopo_id")
+        if "escopo_id" not in patch_dict:
+            escopo_id = None if pd.isna(row["escopo_id"]) else int(row["escopo_id"])
+        _validar_escopo(escopo, escopo_id)
+        patch_dict["escopo"] = escopo
+        patch_dict["escopo_id"] = escopo_id
+
+    for col, val in patch_dict.items():
+        df.loc[mask, col] = val
+
+    _write_sazonalidade_df(df)
+    return _serialize_regra(df[mask].iloc[0])
+
+
+@app.get("/regras/escopo/{tipo}")
+def listar_opcoes_escopo(tipo: str) -> list[dict]:
+    queries = {
+        "regiao": "SELECT regiao_id AS id, nome FROM cadastro.regioes ORDER BY nome",
+        "predio": "SELECT predio_id AS id, nome FROM cadastro.predios ORDER BY nome",
+        "segmento": "SELECT segmento_id AS id, nome FROM cadastro.segmentos ORDER BY nome",
+        "unidade": (
+            "SELECT unidade_id AS id, codigo_externo AS nome "
+            "FROM cadastro.unidades ORDER BY codigo_externo"
+        ),
+    }
+    if tipo not in queries:
+        raise HTTPException(status_code=404, detail=f"tipo '{tipo}' não suportado")
+    rows = CON.execute(queries[tipo]).fetchall()
+    return [{"id": r[0], "nome": r[1]} for r in rows]
+
+
+@app.post("/regras/rebuild-simulador")
+def rebuild_simulador() -> dict:
+    """Regenera o simulador.duckdb a partir dos parquets atualizados."""
+    if not SIMULADOR_BUILD_SCRIPT.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"script não encontrado: {SIMULADOR_BUILD_SCRIPT}",
+        )
+    # Fecha a conexão do simulador anexado antes de rebuildar o arquivo
+    global CON
+    CON.close()
+    t0 = time.perf_counter()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SIMULADOR_BUILD_SCRIPT)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        CON = build_duckdb()
+        raise HTTPException(status_code=504, detail="rebuild demorou mais de 120s")
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    CON = build_duckdb()
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"falha no rebuild: {result.stderr[-500:]}",
+        )
+    return {
+        "ok": True,
+        "duration_ms": duration_ms,
+        "stdout_tail": result.stdout[-300:],
     }
 
 

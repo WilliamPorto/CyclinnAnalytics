@@ -4,17 +4,19 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 const TABS: { key: string; label: string }[] = [
   { key: "pb", label: "pb" },
-  { key: "fat_sazonalidade", label: "Sazonalidade" },
-  { key: "fat_dia_semana", label: "Dia da semana" },
-  { key: "fat_eventos", label: "Eventos" },
-  { key: "fat_antecedencia", label: "Antecedência" },
-  { key: "fat_ajuste_portfolio", label: "Ajuste portfólio" },
-  { key: "fat_ajuste_individual", label: "Ajuste individual" },
   { key: "pi", label: "pi" },
-  { key: "d", label: "d (final)" },
-  { key: "ocupacao_portfolio", label: "Ocupação real" },
   { key: "expectativa_portfolio", label: "Ocupação esperada" },
+  { key: "ocupacao_portfolio", label: "Ocupação real" },
+  { key: "gap_ocupacao", label: "Gap (real − esperada)" },
+  { key: "d", label: "d (final)" },
 ];
+
+// Abas que só fazem sentido na view "Por portfólio"
+const PORTFOLIO_ONLY_TABS = new Set([
+  "expectativa_portfolio",
+  "ocupacao_portfolio",
+  "gap_ocupacao",
+]);
 
 type Matrix = {
   table: string;
@@ -129,6 +131,7 @@ export default function DashboardsPage() {
   const [activeTab, setActiveTab] = useState<string>(TABS[0].key);
   const [pageSize, setPageSize] = useState<number>(25);
   const [page, setPage] = useState<number>(1);
+  const [view, setView] = useState<"unidade" | "portfolio">("unidade");
   const [matrix, setMatrix] = useState<Matrix | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -149,10 +152,17 @@ export default function DashboardsPage() {
       .catch((e) => setError(String(e)));
   }, []);
 
-  // Reset page quando mudam filtros ou aba
+  // Reset page quando mudam filtros, aba ou view
   useEffect(() => {
     setPage(1);
-  }, [dataRef, dataInicio, dataFim, activeTab, pageSize]);
+  }, [dataRef, dataInicio, dataFim, activeTab, pageSize, view]);
+
+  // Força view=portfolio nas abas que só fazem sentido nessa granularidade
+  useEffect(() => {
+    if (PORTFOLIO_ONLY_TABS.has(activeTab) && view !== "portfolio") {
+      setView("portfolio");
+    }
+  }, [activeTab, view]);
 
   // Busca matriz
   useEffect(() => {
@@ -165,6 +175,7 @@ export default function DashboardsPage() {
       data_fim: dataFim,
       page: String(page),
       page_size: String(pageSize),
+      view,
     });
     fetch(`/api/simulador/matrix/${activeTab}?${qs}`)
       .then(async (r) => {
@@ -177,7 +188,7 @@ export default function DashboardsPage() {
         setMatrix(null);
       })
       .finally(() => setLoading(false));
-  }, [activeTab, dataRef, dataInicio, dataFim, page, pageSize]);
+  }, [activeTab, dataRef, dataInicio, dataFim, page, pageSize, view]);
 
   const totalPages = matrix ? Math.max(1, Math.ceil(matrix.total_rows / pageSize)) : 1;
 
@@ -222,6 +233,51 @@ export default function DashboardsPage() {
               </option>
             ))}
           </select>
+        </LabeledInput>
+        <LabeledInput label="Visão">
+          <div
+            style={{
+              display: "inline-flex",
+              border: "1px solid #cbd5e1",
+              borderRadius: 6,
+              overflow: "hidden",
+              background: "#ffffff",
+            }}
+          >
+            {(["unidade", "portfolio"] as const).map((v) => {
+              const active = view === v;
+              const disabled =
+                v === "unidade" && PORTFOLIO_ONLY_TABS.has(activeTab);
+              return (
+                <button
+                  key={v}
+                  onClick={() => !disabled && setView(v)}
+                  disabled={disabled}
+                  title={
+                    disabled
+                      ? "Esta aba só faz sentido na visão por portfólio"
+                      : undefined
+                  }
+                  style={{
+                    background: active ? "#1d4ed8" : "transparent",
+                    color: disabled
+                      ? "#cbd5e1"
+                      : active
+                      ? "#ffffff"
+                      : "#475569",
+                    border: 0,
+                    padding: "4px 12px",
+                    fontSize: 12,
+                    fontWeight: active ? 600 : 500,
+                    fontFamily: "inherit",
+                    cursor: disabled ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {v === "unidade" ? "Por unidade" : "Por portfólio"}
+                </button>
+              );
+            })}
+          </div>
         </LabeledInput>
         {loading && <span style={{ color: "#64748b", fontSize: 12 }}>carregando…</span>}
         {error && <span style={{ color: "#dc2626", fontSize: 12 }}>{error}</span>}

@@ -55,6 +55,7 @@ export function NavBar() {
       </span>
       {link("/", "SQL Explorer")}
       {link("/dashboards", "Dashboards")}
+      {link("/regras", "Regras")}
     </nav>
   );
 }

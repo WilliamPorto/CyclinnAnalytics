@@ -1730,6 +1730,56 @@ def deletar_bucket_ocup(
     return {"ok": True, "linhas_removidas": removidas}
 
 
+# TEMPORÁRIO — gera dados sintéticos de ocupação real pra testar a UI.
+# Remover quando o simulador estiver estável.
+FAKE_OCUP_SCRIPT = ROOT / "simulador" / "backend" / "fake_ocupacao_teste.py"
+
+
+@app.post("/regras/fake-ocupacao")
+def gerar_fake_ocupacao(
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
+    if not FAKE_OCUP_SCRIPT.exists():
+        raise HTTPException(
+            status_code=500, detail=f"script não encontrado: {FAKE_OCUP_SCRIPT}"
+        )
+    global CON
+    CON.close()
+    t0 = time.perf_counter()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(FAKE_OCUP_SCRIPT)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        CON = build_duckdb()
+        raise HTTPException(status_code=504, detail="script demorou mais de 60s")
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    CON = build_duckdb()
+    if result.returncode != 0:
+        log_operacao(
+            _get_usuario(x_usuario), "gerar_fake_ocupacao_erro",
+            "sistema", None,
+            {"duration_ms": duration_ms, "erro": result.stderr[-500:]},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"falha: {result.stderr[-500:]}",
+        )
+    log_operacao(
+        _get_usuario(x_usuario), "gerar_fake_ocupacao",
+        "sistema", None,
+        {"duration_ms": duration_ms},
+    )
+    return {
+        "ok": True,
+        "duration_ms": duration_ms,
+        "stdout_tail": result.stdout[-500:],
+    }
+
+
 @app.post("/regras/rebuild-simulador")
 def rebuild_simulador(
     x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),

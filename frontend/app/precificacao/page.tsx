@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 const TABS: { key: string; label: string }[] = [
   { key: "pb", label: "Preço Base" },
@@ -59,7 +60,11 @@ function isWeekend(iso: string): boolean {
   return dow === 0 || dow === 6;
 }
 
-function formatValue(v: number | null, fmt: "currency" | "percent"): string {
+function formatValue(
+  v: number | null,
+  fmt: "currency" | "percent",
+  opts: { signed?: boolean } = { signed: true }
+): string {
   if (v === null || v === undefined) return "";
   if (fmt === "currency") {
     return v.toLocaleString("pt-BR", {
@@ -70,9 +75,15 @@ function formatValue(v: number | null, fmt: "currency" | "percent"): string {
   }
   // percent (stored as decimal)
   const pct = v * 100;
-  const sign = pct > 0 ? "+" : "";
+  const sign = opts.signed && pct > 0 ? "+" : "";
   return `${sign}${pct.toFixed(1)}%`;
 }
+
+// Tabelas de ocupação (sempre positivo): mostra % sem sinal "+"
+const TABLES_UNSIGNED_PCT = new Set([
+  "ocupacao_portfolio",
+  "expectativa_portfolio",
+]);
 
 function cellColor(
   v: number | null,
@@ -147,6 +158,7 @@ export default function DashboardsPage() {
   const [matrix, setMatrix] = useState<Matrix | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   // Inicialização: busca data_referencias disponíveis, seta default
   useEffect(() => {
@@ -200,7 +212,7 @@ export default function DashboardsPage() {
         setMatrix(null);
       })
       .finally(() => setLoading(false));
-  }, [activeTab, dataRef, dataInicio, dataFim, page, pageSize, view]);
+  }, [activeTab, dataRef, dataInicio, dataFim, page, pageSize, view, refreshKey]);
 
   const totalPages = matrix ? Math.max(1, Math.ceil(matrix.total_rows / pageSize)) : 1;
 
@@ -293,6 +305,9 @@ export default function DashboardsPage() {
         </LabeledInput>
         {loading && <span style={{ color: "#64748b", fontSize: 12 }}>carregando…</span>}
         {error && <span style={{ color: "#dc2626", fontSize: 12 }}>{error}</span>}
+        <div style={{ flex: 1 }} />
+        {/* TEMPORÁRIO — remover quando não precisar mais testar */}
+        <FakeOcupacaoButton onDone={() => setRefreshKey((k) => k + 1)} />
       </div>
 
       {/* Abas */}
@@ -354,7 +369,8 @@ export default function DashboardsPage() {
           </span>
           {matrix.rows.length > 0 && (
             <span style={{ marginLeft: "auto", color: "#64748b" }}>
-              min: {formatValue(matrix.min, matrix.format)} &nbsp; max: {formatValue(matrix.max, matrix.format)}
+              min: {formatValue(matrix.min, matrix.format, { signed: !TABLES_UNSIGNED_PCT.has(matrix.table) })}
+              &nbsp; max: {formatValue(matrix.max, matrix.format, { signed: !TABLES_UNSIGNED_PCT.has(matrix.table) })}
             </span>
           )}
         </div>
@@ -466,7 +482,11 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                   }}
                   title={tooltip}
                 >
-                  {v === null ? "—" : formatValue(v, matrix.format)}
+                  {v === null
+                    ? "—"
+                    : formatValue(v, matrix.format, {
+                        signed: !TABLES_UNSIGNED_PCT.has(matrix.table),
+                      })}
                 </td>
               );
             })}
@@ -474,6 +494,54 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
         ))}
       </tbody>
     </table>
+  );
+}
+
+// TEMPORÁRIO — botão de teste que chama POST /regras/fake-ocupacao.
+// Remover este componente junto com o endpoint quando não precisar mais.
+function FakeOcupacaoButton({ onDone }: { onDone: () => void }) {
+  const [state, setState] = useState<"idle" | "running" | "ok" | "error">("idle");
+  const [msg, setMsg] = useState("");
+
+  const run = async () => {
+    setState("running");
+    setMsg("");
+    try {
+      const r = await apiFetch("/api/regras/fake-ocupacao", { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
+      setState("ok");
+      setMsg(`feito em ${d.duration_ms} ms`);
+      onDone();
+    } catch (e) {
+      setState("error");
+      setMsg(String(e));
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <button
+        onClick={run}
+        disabled={state === "running"}
+        title="Preenche a ocupação real com dados sintéticos próximos da esperada (teste de UI)"
+        style={{
+          background: "#fef3c7",
+          color: "#b45309",
+          border: "1px solid #fcd34d",
+          borderRadius: 5,
+          padding: "4px 10px",
+          fontSize: 11,
+          fontWeight: 600,
+          fontFamily: "inherit",
+          cursor: state === "running" ? "not-allowed" : "pointer",
+        }}
+      >
+        🧪 {state === "running" ? "gerando…" : "fake ocupação (teste)"}
+      </button>
+      {state === "ok" && <span style={{ color: "#15803d", fontSize: 11 }}>✓ {msg}</span>}
+      {state === "error" && <span style={{ color: "#dc2626", fontSize: 11 }}>✕ {msg}</span>}
+    </div>
   );
 }
 

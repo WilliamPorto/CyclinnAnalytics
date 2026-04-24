@@ -161,45 +161,98 @@ def main() -> None:
     print(f"fat_dia_semana        {count(con, 'fat_dia_semana'):>8} linhas")
 
     # ────────────────── 4) fat_eventos ──────────────────
+    # Política: para cada (unidade, dia, evento), usar a regra MAIS ESPECÍFICA
+    # (unidade > predio > regiao > global). Somar ajustes entre EVENTOS DIFERENTES.
+    # Apenas eventos e impactos ativos (ativo=true).
     con.execute(f"""
         CREATE OR REPLACE TABLE fat_eventos AS
+        WITH eventos_ativos AS (
+          SELECT evento_id, data_inicio, data_fim
+          FROM read_parquet({pq('regras_priori/eventos/eventos.parquet')})
+          WHERE COALESCE(ativo, TRUE) = TRUE
+        ),
+        impactos_ativos AS (
+          SELECT evento_id, escopo, escopo_id, ajuste_pct,
+                 CASE escopo
+                   WHEN 'unidade' THEN 1
+                   WHEN 'predio' THEN 2
+                   WHEN 'regiao' THEN 3
+                   WHEN 'global' THEN 4
+                   ELSE 99
+                 END AS prio_escopo
+          FROM read_parquet({pq('regras_priori/evento_impactos/evento_impactos.parquet')})
+          WHERE COALESCE(ativo, TRUE) = TRUE
+        ),
+        matches AS (
+          SELECT
+            ui.unidade_id,
+            c.data,
+            e.evento_id,
+            i.ajuste_pct,
+            ROW_NUMBER() OVER (
+              PARTITION BY ui.unidade_id, c.data, e.evento_id
+              ORDER BY i.prio_escopo
+            ) AS rn
+          FROM unit_info ui
+          CROSS JOIN cal c
+          JOIN eventos_ativos e ON c.data BETWEEN e.data_inicio AND e.data_fim
+          JOIN impactos_ativos i ON i.evento_id = e.evento_id
+            AND (
+              (i.escopo = 'unidade' AND i.escopo_id = ui.unidade_id)
+              OR (i.escopo = 'predio' AND i.escopo_id = ui.predio_id)
+              OR (i.escopo = 'regiao' AND i.escopo_id = ui.regiao_id)
+              OR i.escopo = 'global'
+            )
+        )
         SELECT
           DATE '{TODAY}' AS data_referencia,
           ui.unidade_id,
           c.data,
-          COALESCE(SUM(ei.ajuste_pct), 0.0)::DOUBLE AS ajuste_pct
+          COALESCE(SUM(m.ajuste_pct), 0.0)::DOUBLE AS ajuste_pct
         FROM unit_info ui
         CROSS JOIN cal c
-        LEFT JOIN read_parquet({pq('regras_priori/eventos/eventos.parquet')}) e
-          ON c.data BETWEEN e.data_inicio AND e.data_fim
-        LEFT JOIN read_parquet({pq('regras_priori/evento_impactos/evento_impactos.parquet')}) ei
-          ON ei.evento_id = e.evento_id
-          AND (
-            (ei.escopo = 'regiao'  AND ei.escopo_id = ui.regiao_id)
-            OR (ei.escopo = 'predio'  AND ei.escopo_id = ui.predio_id)
-            OR (ei.escopo = 'unidade' AND ei.escopo_id = ui.unidade_id)
-          )
+        LEFT JOIN matches m
+          ON m.unidade_id = ui.unidade_id AND m.data = c.data AND m.rn = 1
         GROUP BY ui.unidade_id, c.data
     """)
     print(f"fat_eventos           {count(con, 'fat_eventos'):>8} linhas")
 
     # ────────────────── 5) fat_antecedencia ──────────────────
-    # lead = data - data_referencia (dias)
-    # Regra aplica se lead ∈ [lead_min, lead_max) e (dia_semana IS NULL OU match)
+    # lead = data - data_referencia (dias). Regras NÃO cumulativas (só uma faixa aplica).
+    # Dentro da faixa: regra DOW-específica ganha da regra uniforme. Inativas ignoradas.
     con.execute(f"""
         CREATE OR REPLACE TABLE fat_antecedencia AS
+        WITH regras AS (
+          SELECT lead_min_dias, lead_max_dias, dia_semana, ajuste_pct,
+                 CASE WHEN dia_semana IS NULL THEN 2 ELSE 1 END AS prio
+          FROM read_parquet({pq('regras_priori/regras_antecedencia/regras_antecedencia.parquet')})
+          WHERE COALESCE(ativo, TRUE) = TRUE
+        ),
+        matched AS (
+          SELECT
+            ui.unidade_id,
+            c.data,
+            r.ajuste_pct,
+            ROW_NUMBER() OVER (
+              PARTITION BY ui.unidade_id, c.data
+              ORDER BY r.prio
+            ) AS rn
+          FROM unit_info ui
+          CROSS JOIN cal c
+          JOIN regras r
+            ON datediff('day', DATE '{TODAY}', c.data) >= r.lead_min_dias
+            AND datediff('day', DATE '{TODAY}', c.data) <  r.lead_max_dias
+            AND (r.dia_semana IS NULL OR r.dia_semana = (isodow(c.data) - 1))
+        )
         SELECT
           DATE '{TODAY}' AS data_referencia,
           ui.unidade_id,
           c.data,
-          COALESCE(SUM(r.ajuste_pct), 0.0)::DOUBLE AS ajuste_pct
+          COALESCE(m.ajuste_pct, 0.0)::DOUBLE AS ajuste_pct
         FROM unit_info ui
         CROSS JOIN cal c
-        LEFT JOIN read_parquet({pq('regras_priori/regras_antecedencia/regras_antecedencia.parquet')}) r
-          ON datediff('day', DATE '{TODAY}', c.data) >= r.lead_min_dias
-          AND datediff('day', DATE '{TODAY}', c.data) <  r.lead_max_dias
-          AND (r.dia_semana IS NULL OR r.dia_semana = (isodow(c.data) - 1))
-        GROUP BY ui.unidade_id, c.data
+        LEFT JOIN matched m
+          ON m.unidade_id = ui.unidade_id AND m.data = c.data AND m.rn = 1
     """)
     print(f"fat_antecedencia      {count(con, 'fat_antecedencia'):>8} linhas")
 

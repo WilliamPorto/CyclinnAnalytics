@@ -850,6 +850,459 @@ def toggle_ativo_dia_semana(body: AtivoDiaSemanaPatch) -> dict:
     return {"ok": True, "linhas_afetadas": int(mask.sum())}
 
 
+# ─── Eventos (matriz evento × escopo) ──────────────────────────
+
+EVENTOS_PARQUET = DATA_ROOT / "regras_priori" / "eventos" / "eventos.parquet"
+IMPACTOS_PARQUET = DATA_ROOT / "regras_priori" / "evento_impactos" / "evento_impactos.parquet"
+
+CATEGORIAS_EVENTO = {"esportivo", "show", "feriado", "convencao"}
+
+
+def _read_eventos_df() -> pd.DataFrame:
+    if not EVENTOS_PARQUET.exists():
+        return pd.DataFrame(
+            columns=["evento_id", "nome", "data_inicio", "data_fim", "categoria", "ativo"]
+        )
+    df = pd.read_parquet(EVENTOS_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_eventos_df(df: pd.DataFrame) -> None:
+    EVENTOS_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["evento_id"] = df["evento_id"].astype("int64")
+        df["data_inicio"] = pd.to_datetime(df["data_inicio"]).dt.date
+        df["data_fim"] = pd.to_datetime(df["data_fim"]).dt.date
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(EVENTOS_PARQUET, index=False)
+
+
+def _read_impactos_df() -> pd.DataFrame:
+    if not IMPACTOS_PARQUET.exists():
+        return pd.DataFrame(
+            columns=["impacto_id", "evento_id", "escopo", "escopo_id", "ajuste_pct", "ativo"]
+        )
+    df = pd.read_parquet(IMPACTOS_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_impactos_df(df: pd.DataFrame) -> None:
+    IMPACTOS_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["impacto_id"] = df["impacto_id"].astype("int64")
+        df["evento_id"] = df["evento_id"].astype("int64")
+        df["escopo_id"] = df["escopo_id"].astype("Int64")
+        df["ajuste_pct"] = df["ajuste_pct"].astype(float)
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(IMPACTOS_PARQUET, index=False)
+
+
+def _nome_escopo_lookup(escopo: str, escopo_id: Optional[int]) -> str:
+    if escopo == "global":
+        return "Global"
+    table = {
+        "regiao": ("cadastro.regioes", "regiao_id"),
+        "predio": ("cadastro.predios", "predio_id"),
+        "unidade": ("cadastro.unidades", "unidade_id"),
+    }.get(escopo)
+    if not table or escopo_id is None:
+        return f"{escopo} #{escopo_id}"
+    t, c = table
+    if escopo == "unidade":
+        sql = f"SELECT codigo_externo FROM {t} WHERE {c} = ?"
+    else:
+        sql = f"SELECT nome FROM {t} WHERE {c} = ?"
+    r = CON.execute(sql, [escopo_id]).fetchone()
+    return r[0] if r else f"{escopo} #{escopo_id}"
+
+
+@app.get("/regras/eventos/matriz")
+def matriz_eventos(incluir_inativos: bool = True) -> dict:
+    eventos = _read_eventos_df()
+    impactos = _read_impactos_df()
+
+    if not incluir_inativos:
+        eventos = eventos[eventos["ativo"]]
+
+    # Agrupa impactos por evento (só ativos)
+    impactos_por_evento: dict[int, list[dict]] = {}
+    for _, imp in impactos[impactos["ativo"]].iterrows():
+        eid = int(imp["evento_id"])
+        impactos_por_evento.setdefault(eid, []).append(
+            {
+                "escopo": imp["escopo"],
+                "escopo_id": None if pd.isna(imp["escopo_id"]) else int(imp["escopo_id"]),
+                "ajuste_pct": float(imp["ajuste_pct"]),
+            }
+        )
+
+    eventos_out = []
+    for _, ev in eventos.sort_values("data_inicio").iterrows():
+        eventos_out.append(
+            {
+                "evento_id": int(ev["evento_id"]),
+                "nome": str(ev["nome"]),
+                "data_inicio": ev["data_inicio"].isoformat() if hasattr(ev["data_inicio"], "isoformat") else str(ev["data_inicio"]),
+                "data_fim": ev["data_fim"].isoformat() if hasattr(ev["data_fim"], "isoformat") else str(ev["data_fim"]),
+                "categoria": str(ev["categoria"]),
+                "ativo": bool(ev["ativo"]),
+                "impactos": impactos_por_evento.get(int(ev["evento_id"]), []),
+            }
+        )
+
+    # Escopos "usados" (únicos, com algum impacto ativo)
+    usados_keys: set[tuple[str, Optional[int]]] = set()
+    for imps in impactos_por_evento.values():
+        for imp in imps:
+            usados_keys.add((imp["escopo"], imp["escopo_id"]))
+    ordem = {"global": 0, "regiao": 1, "predio": 2, "unidade": 3}
+    escopos_usados = [
+        {"escopo": esc, "escopo_id": eid, "nome": _nome_escopo_lookup(esc, eid)}
+        for esc, eid in usados_keys
+    ]
+    escopos_usados.sort(key=lambda e: (ordem.get(e["escopo"], 9), e["nome"]))
+
+    return {"eventos": eventos_out, "escopos_usados": escopos_usados}
+
+
+class EventoIn(BaseModel):
+    nome: str = Field(..., min_length=1, max_length=120)
+    data_inicio: str
+    data_fim: str
+    categoria: str
+
+
+class EventoPatch(BaseModel):
+    nome: Optional[str] = None
+    data_inicio: Optional[str] = None
+    data_fim: Optional[str] = None
+    categoria: Optional[str] = None
+    ativo: Optional[bool] = None
+
+
+def _validar_categoria(cat: str) -> None:
+    if cat not in CATEGORIAS_EVENTO:
+        raise HTTPException(
+            status_code=400,
+            detail=f"categoria inválida. Use: {sorted(CATEGORIAS_EVENTO)}",
+        )
+
+
+@app.post("/regras/eventos", status_code=201)
+def criar_evento(body: EventoIn) -> dict:
+    d_ini, d_fim = _validar_datas(body.data_inicio, body.data_fim)
+    _validar_categoria(body.categoria)
+
+    df = _read_eventos_df()
+    next_id = int(df["evento_id"].max()) + 1 if not df.empty else 1
+    novo = {
+        "evento_id": next_id,
+        "nome": body.nome,
+        "data_inicio": d_ini,
+        "data_fim": d_fim,
+        "categoria": body.categoria,
+        "ativo": True,
+    }
+    df = pd.concat([df, pd.DataFrame([novo])], ignore_index=True)
+    _write_eventos_df(df)
+    return {
+        "evento_id": next_id,
+        "nome": body.nome,
+        "data_inicio": d_ini.isoformat(),
+        "data_fim": d_fim.isoformat(),
+        "categoria": body.categoria,
+        "ativo": True,
+        "impactos": [],
+    }
+
+
+@app.patch("/regras/eventos/{evento_id}")
+def editar_evento(evento_id: int, body: EventoPatch) -> dict:
+    df = _read_eventos_df()
+    mask = df["evento_id"] == evento_id
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"evento {evento_id} não encontrado")
+
+    patch = body.model_dump(exclude_none=True)
+
+    if "data_inicio" in patch or "data_fim" in patch:
+        row = df[mask].iloc[0]
+        d_ini_s = patch.get("data_inicio") or str(row["data_inicio"])
+        d_fim_s = patch.get("data_fim") or str(row["data_fim"])
+        d_ini, d_fim = _validar_datas(d_ini_s, d_fim_s)
+        patch["data_inicio"] = d_ini
+        patch["data_fim"] = d_fim
+
+    if "categoria" in patch:
+        _validar_categoria(patch["categoria"])
+
+    for col, val in patch.items():
+        df.loc[mask, col] = val
+
+    _write_eventos_df(df)
+    return {"ok": True}
+
+
+class ImpactoPatch(BaseModel):
+    escopo: str = Field(..., pattern="^(global|regiao|predio|unidade)$")
+    escopo_id: Optional[int] = None
+    ajuste_pct: float = Field(..., ge=-1.0, le=3.0)
+
+
+@app.patch("/regras/eventos/{evento_id}/impacto")
+def upsert_impacto(evento_id: int, body: ImpactoPatch) -> dict:
+    # Valida evento existe e ativo
+    ev_df = _read_eventos_df()
+    if not (ev_df["evento_id"] == evento_id).any():
+        raise HTTPException(status_code=404, detail=f"evento {evento_id} não encontrado")
+
+    _validar_escopo(body.escopo, body.escopo_id)
+
+    imp_df = _read_impactos_df()
+    mask = (
+        (imp_df["evento_id"] == evento_id)
+        & (imp_df["escopo"] == body.escopo)
+        & (
+            (imp_df["escopo_id"].isna() & (body.escopo_id is None))
+            | (imp_df["escopo_id"] == body.escopo_id)
+        )
+    )
+
+    # Ajuste zero → remove (desativa) o impacto
+    if abs(body.ajuste_pct) < 1e-6:
+        if mask.any():
+            imp_df.loc[mask, "ativo"] = False
+        _write_impactos_df(imp_df)
+        return {"ok": True, "acao": "removido"}
+
+    if mask.any():
+        imp_df.loc[mask, "ajuste_pct"] = body.ajuste_pct
+        imp_df.loc[mask, "ativo"] = True
+        acao = "atualizado"
+    else:
+        next_id = int(imp_df["impacto_id"].max()) + 1 if not imp_df.empty else 1
+        novo = {
+            "impacto_id": next_id,
+            "evento_id": evento_id,
+            "escopo": body.escopo,
+            "escopo_id": body.escopo_id,
+            "ajuste_pct": body.ajuste_pct,
+            "ativo": True,
+        }
+        imp_df = pd.concat([imp_df, pd.DataFrame([novo])], ignore_index=True)
+        acao = "criado"
+
+    _write_impactos_df(imp_df)
+    return {"ok": True, "acao": acao}
+
+
+# ─── Antecedência (faixas de lead_time) ───────────────────────
+
+ANTECEDENCIA_PARQUET = (
+    DATA_ROOT / "regras_priori" / "regras_antecedencia" / "regras_antecedencia.parquet"
+)
+
+
+def _read_antecedencia_df() -> pd.DataFrame:
+    if not ANTECEDENCIA_PARQUET.exists():
+        return pd.DataFrame(
+            columns=[
+                "regra_id", "escopo", "escopo_id",
+                "lead_min_dias", "lead_max_dias", "dia_semana",
+                "ajuste_pct", "ativo",
+            ]
+        )
+    df = pd.read_parquet(ANTECEDENCIA_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_antecedencia_df(df: pd.DataFrame) -> None:
+    ANTECEDENCIA_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["regra_id"] = df["regra_id"].astype("int64")
+        df["lead_min_dias"] = df["lead_min_dias"].astype("int64")
+        df["lead_max_dias"] = df["lead_max_dias"].astype("int64")
+        df["dia_semana"] = df["dia_semana"].astype("Int64")
+        df["ajuste_pct"] = df["ajuste_pct"].astype(float)
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(ANTECEDENCIA_PARQUET, index=False)
+
+
+def _serializar_faixas(df: pd.DataFrame) -> list[dict]:
+    """Agrupa linhas em faixas (lead_min, lead_max). Determina se é uniforme ou por DOW."""
+    out = []
+    for (mn, mx), g in df.groupby(["lead_min_dias", "lead_max_dias"]):
+        dow_rows = g[g["dia_semana"].notna()]
+        uniform_rows = g[g["dia_semana"].isna()]
+        if len(dow_rows) > 0:
+            por_dow = True
+            dow_values = [0.0] * 7
+            for _, r in dow_rows.iterrows():
+                idx = int(r["dia_semana"])
+                if 0 <= idx < 7:
+                    dow_values[idx] = float(r["ajuste_pct"])
+            ajuste_uniforme = None
+            ajustes_dow = dow_values
+        else:
+            por_dow = False
+            ajuste_uniforme = float(uniform_rows["ajuste_pct"].iloc[0]) if len(uniform_rows) else 0.0
+            ajustes_dow = None
+        out.append({
+            "lead_min_dias": int(mn),
+            "lead_max_dias": int(mx),
+            "por_dow": por_dow,
+            "ajuste_uniforme": ajuste_uniforme,
+            "ajustes_dow": ajustes_dow,
+            "ativo": bool(g["ativo"].all()),
+        })
+    out.sort(key=lambda f: f["lead_min_dias"])
+    return out
+
+
+def _calcular_gaps(faixas_ativas: list[dict], limite: int = 365) -> list[dict]:
+    intervals = sorted(
+        (f["lead_min_dias"], f["lead_max_dias"]) for f in faixas_ativas
+    )
+    gaps = []
+    prev_end = 0
+    for mn, mx in intervals:
+        if mn > prev_end:
+            gaps.append({"lead_min_dias": prev_end, "lead_max_dias": mn})
+        prev_end = max(prev_end, mx)
+    if prev_end < limite:
+        gaps.append({"lead_min_dias": prev_end, "lead_max_dias": limite})
+    return gaps
+
+
+@app.get("/regras/antecedencia")
+def listar_antecedencia(incluir_inativas: bool = True) -> dict:
+    df = _read_antecedencia_df()
+    if not incluir_inativas:
+        df = df[df["ativo"]]
+    if df.empty:
+        return {"faixas": [], "gaps": [{"lead_min_dias": 0, "lead_max_dias": 365}]}
+    faixas = _serializar_faixas(df)
+    gaps = _calcular_gaps([f for f in faixas if f["ativo"]])
+    return {"faixas": faixas, "gaps": gaps}
+
+
+class FaixaAntecedenciaIn(BaseModel):
+    lead_min_dias: int = Field(..., ge=0, le=365)
+    lead_max_dias: int = Field(..., gt=0, le=365)
+    por_dow: bool
+    ajuste_uniforme: Optional[float] = None
+    ajustes_dow: Optional[list[float]] = None
+
+
+def _checar_sobreposicao(
+    df: pd.DataFrame,
+    mn: int,
+    mx: int,
+    ignorar_faixa: Optional[tuple[int, int]] = None,
+) -> None:
+    if mn >= mx:
+        raise HTTPException(status_code=400, detail="lead_min_dias deve ser < lead_max_dias")
+    ativas = df[df["ativo"]]
+    faixas_existentes: set[tuple[int, int]] = set(
+        (int(a), int(b)) for a, b in zip(ativas["lead_min_dias"], ativas["lead_max_dias"])
+    )
+    if ignorar_faixa is not None:
+        faixas_existentes.discard(ignorar_faixa)
+    for a, b in faixas_existentes:
+        if mx > a and mn < b:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Nova faixa sobrepõe com {a}-{b} dias",
+            )
+
+
+def _construir_linhas_faixa(
+    df: pd.DataFrame, body: FaixaAntecedenciaIn
+) -> list[dict]:
+    next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+    linhas = []
+    if body.por_dow:
+        vals = body.ajustes_dow or [0.0] * 7
+        if len(vals) != 7:
+            raise HTTPException(status_code=400, detail="ajustes_dow precisa ter 7 valores")
+        for i in range(7):
+            linhas.append({
+                "regra_id": next_id,
+                "escopo": "global",
+                "escopo_id": None,
+                "lead_min_dias": body.lead_min_dias,
+                "lead_max_dias": body.lead_max_dias,
+                "dia_semana": i,
+                "ajuste_pct": float(vals[i]),
+                "ativo": True,
+            })
+            next_id += 1
+    else:
+        linhas.append({
+            "regra_id": next_id,
+            "escopo": "global",
+            "escopo_id": None,
+            "lead_min_dias": body.lead_min_dias,
+            "lead_max_dias": body.lead_max_dias,
+            "dia_semana": None,
+            "ajuste_pct": float(body.ajuste_uniforme or 0),
+            "ativo": True,
+        })
+    return linhas
+
+
+@app.post("/regras/antecedencia/faixa", status_code=201)
+def criar_faixa_antecedencia(body: FaixaAntecedenciaIn) -> dict:
+    df = _read_antecedencia_df()
+    _checar_sobreposicao(df, body.lead_min_dias, body.lead_max_dias)
+    linhas = _construir_linhas_faixa(df, body)
+    df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
+    _write_antecedencia_df(df)
+    return {"ok": True}
+
+
+@app.put("/regras/antecedencia/faixa/{lead_min}/{lead_max}")
+def atualizar_faixa_antecedencia(lead_min: int, lead_max: int, body: FaixaAntecedenciaIn) -> dict:
+    df = _read_antecedencia_df()
+    mask = (df["lead_min_dias"] == lead_min) & (df["lead_max_dias"] == lead_max)
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Faixa não encontrada")
+    _checar_sobreposicao(
+        df, body.lead_min_dias, body.lead_max_dias,
+        ignorar_faixa=(lead_min, lead_max),
+    )
+    # Remove linhas antigas da faixa e adiciona novas
+    df = df[~mask].copy()
+    linhas = _construir_linhas_faixa(df, body)
+    df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
+    _write_antecedencia_df(df)
+    return {"ok": True}
+
+
+class AtivoAntecedenciaPatch(BaseModel):
+    ativo: bool
+
+
+@app.patch("/regras/antecedencia/faixa/{lead_min}/{lead_max}/ativo")
+def toggle_ativo_faixa_antecedencia(lead_min: int, lead_max: int, body: AtivoAntecedenciaPatch) -> dict:
+    df = _read_antecedencia_df()
+    mask = (df["lead_min_dias"] == lead_min) & (df["lead_max_dias"] == lead_max)
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Faixa não encontrada")
+    df.loc[mask, "ativo"] = body.ativo
+    _write_antecedencia_df(df)
+    return {"ok": True, "linhas_afetadas": int(mask.sum())}
+
+
 @app.post("/regras/rebuild-simulador")
 def rebuild_simulador() -> dict:
     """Regenera o simulador.duckdb a partir dos parquets atualizados."""

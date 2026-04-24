@@ -358,9 +358,10 @@ def simulador_matrix(
 
     # Define se a tabela injeta uma coluna color_pct (usada pra heatmap por
     # diferença em vez de pelo valor absoluto).
-    #   pi                  → color_pct = (pi − pb) / pb
+    #   pi                  → color_pct = (pi − pb) / pb    (fatores a priori)
+    #   d                   → color_pct = (d − pb) / pb     (impacto total vs preço base)
     #   ocupacao_portfolio  → color_pct = real − esperada
-    has_color_pct = table in ("pi", "ocupacao_portfolio")
+    has_color_pct = table in ("pi", "d", "ocupacao_portfolio")
 
     def build_values_sql(ids_filter: str) -> str:
         # Ocupação real: v = real, color_pct = (real − esperada) → heatmap pelo gap
@@ -402,6 +403,33 @@ def simulador_matrix(
                   AND pi.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
                   {ids_filter}
                 GROUP BY p.regiao_id, pi.data
+            """
+        # d: retorna também o % de diferença vs Pb (= impacto total vs preço base)
+        if table == "d":
+            if not needs_aggregation:
+                return f"""
+                    SELECT d.unidade_id AS id, d.data, d.valor AS v,
+                           (d.valor - pb.valor) / pb.valor AS color_pct
+                    FROM {SIMULADOR_ALIAS}.main.d d
+                    JOIN {SIMULADOR_ALIAS}.main.pb pb
+                      USING(data_referencia, unidade_id, data)
+                    WHERE d.data_referencia = DATE '{d_ref_s}'
+                      AND d.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                      {ids_filter.replace('unidade_id', 'd.unidade_id')}
+                """
+            return f"""
+                SELECT p.regiao_id AS id, d.data,
+                       AVG(d.valor) AS v,
+                       AVG((d.valor - pb.valor) / pb.valor) AS color_pct
+                FROM {SIMULADOR_ALIAS}.main.d d
+                JOIN {SIMULADOR_ALIAS}.main.pb pb
+                  USING(data_referencia, unidade_id, data)
+                JOIN cadastro.unidades u ON u.unidade_id = d.unidade_id
+                JOIN cadastro.predios p USING(predio_id)
+                WHERE d.data_referencia = DATE '{d_ref_s}'
+                  AND d.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                  {ids_filter}
+                GROUP BY p.regiao_id, d.data
             """
         if not needs_aggregation:
             key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
@@ -456,6 +484,24 @@ def simulador_matrix(
     color_min = float(stats[2]) if has_color_pct and stats[2] is not None else None
     color_max = float(stats[3]) if has_color_pct and stats[3] is not None else None
 
+    # Linha de totais (apenas para a matriz `d`): soma do impacto em R$ por dia
+    # considerando TODAS as unidades do portfolio, independente de paginação/view.
+    day_totals: Optional[list[Optional[float]]] = None
+    if table == "d":
+        totals_rows = CON.execute(
+            f"""
+            SELECT d.data, SUM(d.valor - pb.valor) AS impacto
+            FROM {SIMULADOR_ALIAS}.main.d d
+            JOIN {SIMULADOR_ALIAS}.main.pb pb
+              USING(data_referencia, unidade_id, data)
+            WHERE d.data_referencia = DATE '{d_ref_s}'
+              AND d.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+            GROUP BY d.data
+            """
+        ).fetchall()
+        totals_map = {r[0].isoformat(): float(r[1]) if r[1] is not None else None for r in totals_rows}
+        day_totals = [totals_map.get(d) for d in date_cols]
+
     return {
         "table": table,
         "data_referencia": data_referencia,
@@ -475,6 +521,7 @@ def simulador_matrix(
         "color_min": color_min,
         "color_max": color_max,
         "color_format": "percent" if has_color_pct else None,
+        "day_totals": day_totals,
     }
 
 

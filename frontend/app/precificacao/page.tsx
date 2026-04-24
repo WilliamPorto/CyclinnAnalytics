@@ -20,6 +20,7 @@ const PORTFOLIO_ONLY_TABS = new Set([
 // Label contextual do "delta" mostrado no tooltip quando há color_values
 const COLOR_DELTA_LABEL: Record<string, string> = {
   pi: "vs Pb",
+  d: "vs Pb",
   ocupacao_portfolio: "vs esperada",
 };
 
@@ -45,6 +46,7 @@ type Matrix = {
   color_min?: number | null;
   color_max?: number | null;
   color_format?: "currency" | "percent" | null;
+  day_totals?: (number | null)[] | null;
 };
 
 const MONTHS_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
@@ -493,6 +495,57 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
           </tr>
         ))}
       </tbody>
+      {matrix.day_totals && (
+        <tfoot>
+          <tr>
+            <th
+              style={{
+                ...firstColStyle,
+                position: "sticky",
+                bottom: 0,
+                background: "#f1f5f9",
+                borderTop: "2px solid #94a3b8",
+                fontWeight: 600,
+                color: "#0f172a",
+                zIndex: 2,
+              }}
+              title="Soma diária do impacto (Preço Final − Preço Base) em todas as unidades do portfólio"
+            >
+              Impacto (R$)
+            </th>
+            {matrix.day_totals.map((t, i) => {
+              const color = t === null || t === 0 ? "#475569" : t > 0 ? "#15803d" : "#b91c1c";
+              const txt =
+                t === null
+                  ? "—"
+                  : `${t > 0 ? "+" : ""}${t.toLocaleString("pt-BR", {
+                      style: "currency",
+                      currency: "BRL",
+                      maximumFractionDigits: 0,
+                    })}`;
+              return (
+                <td
+                  key={i}
+                  style={{
+                    position: "sticky",
+                    bottom: 0,
+                    background: "#f1f5f9",
+                    borderTop: "2px solid #94a3b8",
+                    padding: "4px 8px",
+                    textAlign: "right",
+                    whiteSpace: "nowrap",
+                    fontVariantNumeric: "tabular-nums",
+                    fontWeight: 600,
+                    color,
+                  }}
+                >
+                  {txt}
+                </td>
+              );
+            })}
+          </tr>
+        </tfoot>
+      )}
     </table>
   );
 }

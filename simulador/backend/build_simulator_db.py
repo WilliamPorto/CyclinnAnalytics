@@ -252,21 +252,46 @@ def main() -> None:
     """)
     print(f"fat_antecedencia      {count(con, 'fat_antecedencia'):>8} linhas")
 
-    # ────────────────── 6) fat_ajuste_portfolio ──────────────────
+    # ────────────────── 6) ocupacao_portfolio (real) ──────────────────
+    # Por região = (unidades com reserva_diaria) / (total de unidades da região).
+    # Criada aqui (antes de fat_ajuste_portfolio) pra servir de fonte única da
+    # ocupação real — assim o fake_ocupacao_teste consegue trocar a ocupação
+    # e recompor só fat_ajuste_portfolio + d.
+    con.execute(f"""
+        CREATE OR REPLACE TABLE ocupacao_portfolio AS
+        WITH total AS (
+          SELECT regiao_id, COUNT(*) AS total
+          FROM unit_info GROUP BY regiao_id
+        ),
+        ocupadas AS (
+          SELECT ui.regiao_id, rd.data, COUNT(DISTINCT rd.unidade_id) AS ocupadas
+          FROM read_parquet({pq('reservas/reserva_diarias/reserva_diarias.parquet')}) rd
+          JOIN unit_info ui USING(unidade_id)
+          GROUP BY ui.regiao_id, rd.data
+        )
+        SELECT
+          DATE '{TODAY}' AS data_referencia,
+          t.regiao_id AS portfolio_id,
+          c.data,
+          ROUND(COALESCE(o.ocupadas::DOUBLE / t.total, 0.0), 4) AS ocupacao_pct
+        FROM total t
+        CROSS JOIN cal c
+        LEFT JOIN ocupadas o ON o.regiao_id = t.regiao_id AND o.data = c.data
+    """)
+    print(f"ocupacao_portfolio    {count(con, 'ocupacao_portfolio'):>8} linhas")
+
+    # ────────────────── 7) fat_ajuste_portfolio ──────────────────
     # Para cada (unidade, data): determina o bucket pela antecedência,
-    # pega a ocupação real do portfólio (região) naquele dia e aplica a banda.
-    # Regras globais (iguais pra todas as regiões), gap-free (bandas cobrem 0-100%).
+    # pega a ocupação real do portfólio (região) da tabela ocupacao_portfolio
+    # e aplica a banda. Regras globais, gap-free (bandas cobrem 0-100%).
     con.execute(f"""
         CREATE OR REPLACE TABLE fat_ajuste_portfolio AS
         WITH regras AS (
           SELECT janela_dias, ocupacao_min_pct, ocupacao_max_pct, ajuste_pct
           FROM read_parquet({pq('regras_posteriori/regras_ocupacao_portfolio/regras_ocupacao_portfolio.parquet')})
-                  ),
-        janelas AS (
-          SELECT DISTINCT janela_dias FROM regras
         ),
+        janelas AS (SELECT DISTINCT janela_dias FROM regras),
         janela_max AS (SELECT MAX(janela_dias) AS max_j FROM janelas),
-        -- Para cada dia, escolhe o bucket: menor janela_dias >= lead; senão a maior
         cal_bucket AS (
           SELECT c.data,
                  COALESCE(
@@ -276,28 +301,12 @@ def main() -> None:
                  ) AS bucket
           FROM cal c
         ),
-        -- Ocupação real por portfólio (região) × dia, derivada das reserva_diarias
-        total_por_regiao AS (
-          SELECT regiao_id, COUNT(*) AS total FROM unit_info GROUP BY regiao_id
-        ),
-        ocupadas AS (
-          SELECT ui.regiao_id, rd.data, COUNT(DISTINCT rd.unidade_id) AS ocupadas
-          FROM read_parquet({pq('reservas/reserva_diarias/reserva_diarias.parquet')}) rd
-          JOIN unit_info ui USING(unidade_id)
-          GROUP BY ui.regiao_id, rd.data
-        ),
-        ocup AS (
-          SELECT t.regiao_id, c.data,
-                 COALESCE(o.ocupadas::DOUBLE / t.total, 0.0) AS ocupacao_pct
-          FROM total_por_regiao t
-          CROSS JOIN cal c
-          LEFT JOIN ocupadas o ON o.regiao_id = t.regiao_id AND o.data = c.data
-        ),
         aplicada AS (
           SELECT ui.unidade_id, cb.data, r.ajuste_pct
           FROM unit_info ui
           CROSS JOIN cal_bucket cb
-          LEFT JOIN ocup o ON o.regiao_id = ui.regiao_id AND o.data = cb.data
+          LEFT JOIN ocupacao_portfolio o
+            ON o.portfolio_id = ui.regiao_id AND o.data = cb.data
           LEFT JOIN regras r
             ON r.janela_dias = cb.bucket
             AND o.ocupacao_pct >= r.ocupacao_min_pct
@@ -369,31 +378,6 @@ def main() -> None:
         LEFT JOIN fat_ajuste_individual fi USING(data_referencia, unidade_id, data)
     """)
     print(f"d                     {count(con, 'd'):>8} linhas")
-
-    # ────────────────── 10) ocupacao_portfolio (real) ──────────────────
-    # Por região = unidades com reserva_diaria / total de unidades da região
-    con.execute(f"""
-        CREATE OR REPLACE TABLE ocupacao_portfolio AS
-        WITH total AS (
-          SELECT regiao_id, COUNT(*) AS total
-          FROM unit_info GROUP BY regiao_id
-        ),
-        ocupadas AS (
-          SELECT ui.regiao_id, rd.data, COUNT(DISTINCT rd.unidade_id) AS ocupadas
-          FROM read_parquet({pq('reservas/reserva_diarias/reserva_diarias.parquet')}) rd
-          JOIN unit_info ui USING(unidade_id)
-          GROUP BY ui.regiao_id, rd.data
-        )
-        SELECT
-          DATE '{TODAY}' AS data_referencia,
-          t.regiao_id AS portfolio_id,
-          c.data,
-          ROUND(COALESCE(o.ocupadas::DOUBLE / t.total, 0.0), 4) AS ocupacao_pct
-        FROM total t
-        CROSS JOIN cal c
-        LEFT JOIN ocupadas o ON o.regiao_id = t.regiao_id AND o.data = c.data
-    """)
-    print(f"ocupacao_portfolio    {count(con, 'ocupacao_portfolio'):>8} linhas")
 
     # ────────────────── 11) expectativa_portfolio ──────────────────
     # Agrega por região (média simples entre segmentos). Dias sem dado → 0.65 default.

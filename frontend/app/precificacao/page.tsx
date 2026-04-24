@@ -7,7 +7,6 @@ const TABS: { key: string; label: string }[] = [
   { key: "pi", label: "Preço Inicial" },
   { key: "expectativa_portfolio", label: "Ocupação esperada" },
   { key: "ocupacao_portfolio", label: "Ocupação real" },
-  { key: "gap_ocupacao", label: "Gap (real − esperada)" },
   { key: "d", label: "Preço Final" },
 ];
 
@@ -15,8 +14,13 @@ const TABS: { key: string; label: string }[] = [
 const PORTFOLIO_ONLY_TABS = new Set([
   "expectativa_portfolio",
   "ocupacao_portfolio",
-  "gap_ocupacao",
 ]);
+
+// Label contextual do "delta" mostrado no tooltip quando há color_values
+const COLOR_DELTA_LABEL: Record<string, string> = {
+  pi: "vs Pb",
+  ocupacao_portfolio: "vs esperada",
+};
 
 type Matrix = {
   table: string;
@@ -26,12 +30,20 @@ type Matrix = {
   format: "currency" | "percent";
   row_type: "unidade" | "portfolio";
   columns: string[];
-  rows: { id: number; label: string; values: (number | null)[] }[];
+  rows: {
+    id: number;
+    label: string;
+    values: (number | null)[];
+    color_values?: (number | null)[];
+  }[];
   total_rows: number;
   page: number;
   page_size: number;
   min: number;
   max: number;
+  color_min?: number | null;
+  color_max?: number | null;
+  color_format?: "currency" | "percent" | null;
 };
 
 const MONTHS_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
@@ -411,7 +423,33 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
           <tr key={row.id}>
             <th style={firstColStyle}>{row.label}</th>
             {row.values.map((v, i) => {
-              const bg = cellColor(v, matrix.min, matrix.max, matrix.format);
+              const semHeatmap = matrix.table === "pb" || matrix.table === "expectativa_portfolio";
+              // Se o backend mandou color_values, usamos esses valores (em %)
+              // pra colorir; os valores "values" continuam sendo mostrados na célula.
+              const cv = row.color_values?.[i] ?? null;
+              const useColorDriver = cv !== null && matrix.color_min != null && matrix.color_max != null;
+              const bg = v === null
+                ? "#f8fafc"
+                : semHeatmap
+                ? "#dbeafe"
+                : useColorDriver
+                ? cellColor(
+                    cv!,
+                    matrix.color_min!,
+                    matrix.color_max!,
+                    matrix.color_format ?? "percent"
+                  )
+                : cellColor(v, matrix.min, matrix.max, matrix.format);
+              const deltaLabel = COLOR_DELTA_LABEL[matrix.table] ?? "delta";
+              // Em ocupacao_portfolio o próprio valor da célula já mostra a real,
+              // então o tooltip traz apenas o gap. Nas demais (ex: pi) mantém valor + delta.
+              const tooltip = v === null
+                ? "sem dado"
+                : useColorDriver && matrix.table === "ocupacao_portfolio"
+                ? `${formatValue(cv, "percent")} ${deltaLabel}`
+                : useColorDriver
+                ? `${formatValue(v, matrix.format)}  ·  ${formatValue(cv, "percent")} ${deltaLabel}`
+                : formatValue(v, matrix.format);
               return (
                 <td
                   key={i}
@@ -426,7 +464,7 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                     minWidth: 64,
                     fontVariantNumeric: "tabular-nums",
                   }}
-                  title={v === null ? "sem dado" : formatValue(v, matrix.format)}
+                  title={tooltip}
                 >
                   {v === null ? "—" : formatValue(v, matrix.format)}
                 </td>

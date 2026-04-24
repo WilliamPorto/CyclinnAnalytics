@@ -262,8 +262,6 @@ SIMULADOR_TABLES: dict[str, tuple[str, str, str]] = {
     "d":                     ("valor",                  "currency", "unidade"),
     "ocupacao_portfolio":    ("ocupacao_pct",           "percent",  "portfolio"),
     "expectativa_portfolio": ("ocupacao_esperada_pct",  "percent",  "portfolio"),
-    # Tabela virtual: gap = real − esperada (calculado no endpoint)
-    "gap_ocupacao":          ("gap_pct",                "percent",  "portfolio"),
 }
 
 
@@ -358,12 +356,19 @@ def simulador_matrix(
 
     needs_aggregation = effective_row_type == "portfolio" and native_row_type == "unidade"
 
+    # Define se a tabela injeta uma coluna color_pct (usada pra heatmap por
+    # diferença em vez de pelo valor absoluto).
+    #   pi                  → color_pct = (pi − pb) / pb
+    #   ocupacao_portfolio  → color_pct = real − esperada
+    has_color_pct = table in ("pi", "ocupacao_portfolio")
+
     def build_values_sql(ids_filter: str) -> str:
-        # Tabela virtual gap_ocupacao = real − esperada (já por portfólio)
-        if table == "gap_ocupacao":
+        # Ocupação real: v = real, color_pct = (real − esperada) → heatmap pelo gap
+        if table == "ocupacao_portfolio":
             return f"""
                 SELECT o.portfolio_id AS id, o.data,
-                       (o.ocupacao_pct - e.ocupacao_esperada_pct) AS v
+                       o.ocupacao_pct AS v,
+                       (o.ocupacao_pct - e.ocupacao_esperada_pct) AS color_pct
                 FROM {SIMULADOR_ALIAS}.main.ocupacao_portfolio o
                 JOIN {SIMULADOR_ALIAS}.main.expectativa_portfolio e
                   USING(data_referencia, portfolio_id, data)
@@ -371,10 +376,37 @@ def simulador_matrix(
                   AND o.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
                   {ids_filter.replace('portfolio_id', 'o.portfolio_id')}
             """
+        # pi: retorna também o % de diferença vs Pb (= soma dos fatores a priori)
+        if table == "pi":
+            if not needs_aggregation:
+                return f"""
+                    SELECT pi.unidade_id AS id, pi.data, pi.valor AS v,
+                           (pi.valor - pb.valor) / pb.valor AS color_pct
+                    FROM {SIMULADOR_ALIAS}.main.pi pi
+                    JOIN {SIMULADOR_ALIAS}.main.pb pb
+                      USING(data_referencia, unidade_id, data)
+                    WHERE pi.data_referencia = DATE '{d_ref_s}'
+                      AND pi.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                      {ids_filter.replace('unidade_id', 'pi.unidade_id')}
+                """
+            return f"""
+                SELECT p.regiao_id AS id, pi.data,
+                       AVG(pi.valor) AS v,
+                       AVG((pi.valor - pb.valor) / pb.valor) AS color_pct
+                FROM {SIMULADOR_ALIAS}.main.pi pi
+                JOIN {SIMULADOR_ALIAS}.main.pb pb
+                  USING(data_referencia, unidade_id, data)
+                JOIN cadastro.unidades u ON u.unidade_id = pi.unidade_id
+                JOIN cadastro.predios p USING(predio_id)
+                WHERE pi.data_referencia = DATE '{d_ref_s}'
+                  AND pi.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                  {ids_filter}
+                GROUP BY p.regiao_id, pi.data
+            """
         if not needs_aggregation:
             key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
             return f"""
-                SELECT {key_col} AS id, data, {value_col} AS v
+                SELECT {key_col} AS id, data, {value_col} AS v, NULL::DOUBLE AS color_pct
                 FROM {SIMULADOR_ALIAS}.main.{table}
                 WHERE data_referencia = DATE '{d_ref_s}'
                   AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
@@ -382,7 +414,7 @@ def simulador_matrix(
             """
         # Agrega por região (média simples)
         return f"""
-            SELECT p.regiao_id AS id, t.data, AVG(t.{value_col}) AS v
+            SELECT p.regiao_id AS id, t.data, AVG(t.{value_col}) AS v, NULL::DOUBLE AS color_pct
             FROM {SIMULADOR_ALIAS}.main.{table} t
             JOIN cadastro.unidades u ON u.unidade_id = t.unidade_id
             JOIN cadastro.predios p USING(predio_id)
@@ -402,18 +434,27 @@ def simulador_matrix(
             ids_filter = f"AND {key_col} IN ({ids_list})"
         values_rows = CON.execute(build_values_sql(ids_filter)).fetchall()
         lookup: dict[tuple[int, str], Any] = {}
-        for rid, dt, v in values_rows:
+        color_lookup: dict[tuple[int, str], Any] = {}
+        for row in values_rows:
+            rid, dt, v = row[0], row[1], row[2]
             lookup[(rid, dt.isoformat())] = v
+            if len(row) >= 4 and row[3] is not None:
+                color_lookup[(rid, dt.isoformat())] = float(row[3])
         for rid in ids:
             vals = [lookup.get((rid, d)) for d in date_cols]
-            matrix_rows.append({"id": rid, "label": labels[rid], "values": vals})
+            item: dict[str, Any] = {"id": rid, "label": labels[rid], "values": vals}
+            if has_color_pct:
+                item["color_values"] = [color_lookup.get((rid, d)) for d in date_cols]
+            matrix_rows.append(item)
 
     # Min/max global no período (para heatmap consistente entre páginas)
     stats = CON.execute(
-        f"SELECT MIN(v), MAX(v) FROM ({build_values_sql('')}) q"
+        f"SELECT MIN(v), MAX(v), MIN(color_pct), MAX(color_pct) FROM ({build_values_sql('')}) q"
     ).fetchone()
     vmin = float(stats[0]) if stats[0] is not None else 0.0
     vmax = float(stats[1]) if stats[1] is not None else 0.0
+    color_min = float(stats[2]) if has_color_pct and stats[2] is not None else None
+    color_max = float(stats[3]) if has_color_pct and stats[3] is not None else None
 
     return {
         "table": table,
@@ -431,6 +472,9 @@ def simulador_matrix(
         "page_size": page_size,
         "min": vmin,
         "max": vmax,
+        "color_min": color_min,
+        "color_max": color_max,
+        "color_format": "percent" if has_color_pct else None,
     }
 
 

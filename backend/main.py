@@ -647,6 +647,209 @@ def listar_opcoes_escopo(tipo: str) -> list[dict]:
     return [{"id": r[0], "nome": r[1]} for r in rows]
 
 
+# ─── Dia da semana (matriz escopo × DOW) ───────────────────────
+
+DIA_SEMANA_PARQUET = (
+    DATA_ROOT / "regras_priori" / "regras_dia_semana" / "regras_dia_semana.parquet"
+)
+
+
+def _read_dia_semana_df() -> pd.DataFrame:
+    if not DIA_SEMANA_PARQUET.exists():
+        return pd.DataFrame(
+            columns=["regra_id", "escopo", "escopo_id", "dia_semana", "ajuste_pct", "ativo"]
+        )
+    df = pd.read_parquet(DIA_SEMANA_PARQUET)
+    if "ativo" not in df.columns:
+        df["ativo"] = True
+    return df
+
+
+def _write_dia_semana_df(df: pd.DataFrame) -> None:
+    DIA_SEMANA_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["regra_id"] = df["regra_id"].astype("int64")
+        df["escopo_id"] = df["escopo_id"].astype("Int64")
+        df["dia_semana"] = df["dia_semana"].astype("int64")
+        df["ajuste_pct"] = df["ajuste_pct"].astype(float)
+        df["ativo"] = df["ativo"].astype(bool)
+    df.to_parquet(DIA_SEMANA_PARQUET, index=False)
+
+
+@app.get("/regras/dia-semana/matriz")
+def matriz_dia_semana() -> dict:
+    """Retorna a matriz (escopo × DOW).
+
+    Estrutura:
+      {
+        escopos: [{escopo, escopo_id, nome, ativo, values: [seg,ter,qua,qui,sex,sab,dom]}],
+      }
+    Somente escopos global, regiao e predio. Inclui inativos (ativo=false).
+    """
+    df = _read_dia_semana_df()
+    df = df[df["escopo"].isin(["global", "regiao", "predio"])]
+
+    # Agrupa por (escopo, escopo_id): 7 valores por DOW + ativo da linha
+    grupos: list[dict] = []
+    if not df.empty:
+        for (escopo, esc_id), g in df.groupby(["escopo", "escopo_id"], dropna=False):
+            values = [0.0] * 7
+            ativos = []
+            for _, row in g.iterrows():
+                dow = int(row["dia_semana"])
+                if 0 <= dow < 7:
+                    values[dow] = float(row["ajuste_pct"])
+                ativos.append(bool(row["ativo"]))
+            grupos.append(
+                {
+                    "escopo": escopo,
+                    "escopo_id": None if pd.isna(esc_id) else int(esc_id),
+                    "values": values,
+                    "ativo": all(ativos) if ativos else True,
+                }
+            )
+
+    # Decora com nome do escopo
+    def nome_escopo(escopo: str, esc_id: Optional[int]) -> str:
+        if escopo == "global":
+            return "Global (default)"
+        tables = {"regiao": "cadastro.regioes", "predio": "cadastro.predios"}
+        cols = {"regiao": "regiao_id", "predio": "predio_id"}
+        if escopo not in tables or esc_id is None:
+            return f"{escopo} #{esc_id}"
+        r = CON.execute(
+            f"SELECT nome FROM {tables[escopo]} WHERE {cols[escopo]} = ?", [esc_id]
+        ).fetchone()
+        return r[0] if r else f"{escopo} #{esc_id}"
+
+    ordem = {"global": 0, "regiao": 1, "predio": 2}
+    for g in grupos:
+        g["nome"] = nome_escopo(g["escopo"], g["escopo_id"])
+    grupos.sort(key=lambda g: (ordem.get(g["escopo"], 9), g["nome"]))
+
+    return {"escopos": grupos}
+
+
+class NovoEscopoDiaSemana(BaseModel):
+    escopo: str = Field(..., pattern="^(global|regiao|predio)$")
+    escopo_id: Optional[int] = None
+
+
+@app.post("/regras/dia-semana/escopo", status_code=201)
+def criar_escopo_dia_semana(body: NovoEscopoDiaSemana) -> dict:
+    _validar_escopo(body.escopo, body.escopo_id)
+
+    df = _read_dia_semana_df()
+    # Já existe?
+    if body.escopo == "global":
+        mask = df["escopo"] == "global"
+    else:
+        mask = (df["escopo"] == body.escopo) & (df["escopo_id"] == body.escopo_id)
+    if mask.any():
+        raise HTTPException(
+            status_code=409, detail="Esse escopo já tem regras cadastradas"
+        )
+
+    # Valores default: copia do global se existir; senão zeros
+    global_rows = df[df["escopo"] == "global"]
+    defaults = [0.0] * 7
+    if not global_rows.empty:
+        for _, r in global_rows.iterrows():
+            dow = int(r["dia_semana"])
+            if 0 <= dow < 7:
+                defaults[dow] = float(r["ajuste_pct"])
+
+    next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+    novas_rows = []
+    for dow in range(7):
+        novas_rows.append(
+            {
+                "regra_id": next_id,
+                "escopo": body.escopo,
+                "escopo_id": body.escopo_id,
+                "dia_semana": dow,
+                "ajuste_pct": defaults[dow],
+                "ativo": True,
+            }
+        )
+        next_id += 1
+    df = pd.concat([df, pd.DataFrame(novas_rows)], ignore_index=True)
+    _write_dia_semana_df(df)
+    return {
+        "escopo": body.escopo,
+        "escopo_id": body.escopo_id,
+        "values": defaults,
+        "ativo": True,
+    }
+
+
+class CelulaDiaSemanaPatch(BaseModel):
+    escopo: str = Field(..., pattern="^(global|regiao|predio)$")
+    escopo_id: Optional[int] = None
+    dia_semana: int = Field(..., ge=0, le=6)
+    ajuste_pct: float = Field(..., ge=-1.0, le=3.0)
+
+
+@app.patch("/regras/dia-semana/celula")
+def patch_celula_dia_semana(body: CelulaDiaSemanaPatch) -> dict:
+    df = _read_dia_semana_df()
+    if body.escopo == "global":
+        mask = (df["escopo"] == "global") & (df["dia_semana"] == body.dia_semana)
+    else:
+        mask = (
+            (df["escopo"] == body.escopo)
+            & (df["escopo_id"] == body.escopo_id)
+            & (df["dia_semana"] == body.dia_semana)
+        )
+    if not mask.any():
+        # Cria a linha se não existe
+        next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "regra_id": next_id,
+                            "escopo": body.escopo,
+                            "escopo_id": body.escopo_id,
+                            "dia_semana": body.dia_semana,
+                            "ajuste_pct": body.ajuste_pct,
+                            "ativo": True,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    else:
+        df.loc[mask, "ajuste_pct"] = body.ajuste_pct
+        df.loc[mask, "ativo"] = True
+    _write_dia_semana_df(df)
+    return {"ok": True}
+
+
+class AtivoDiaSemanaPatch(BaseModel):
+    escopo: str = Field(..., pattern="^(global|regiao|predio)$")
+    escopo_id: Optional[int] = None
+    ativo: bool
+
+
+@app.patch("/regras/dia-semana/escopo/ativo")
+def toggle_ativo_dia_semana(body: AtivoDiaSemanaPatch) -> dict:
+    df = _read_dia_semana_df()
+    if body.escopo == "global":
+        mask = df["escopo"] == "global"
+    else:
+        mask = (df["escopo"] == body.escopo) & (df["escopo_id"] == body.escopo_id)
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="Escopo não encontrado")
+    df.loc[mask, "ativo"] = body.ativo
+    _write_dia_semana_df(df)
+    return {"ok": True, "linhas_afetadas": int(mask.sum())}
+
+
 @app.post("/regras/rebuild-simulador")
 def rebuild_simulador() -> dict:
     """Regenera o simulador.duckdb a partir dos parquets atualizados."""

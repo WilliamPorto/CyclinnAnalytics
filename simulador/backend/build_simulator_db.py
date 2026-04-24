@@ -113,25 +113,50 @@ def main() -> None:
     # ────────────────── 3) fat_dia_semana ──────────────────
     # Convenção DOW: 0=segunda … 6=domingo (igual Python .weekday())
     # DuckDB: (isodow(data) - 1) mapeia para essa convenção
+    # Política: "mais específico ganha" — prédio > região > global.
+    # Apenas regras ativas (ativo=true ou ativo ausente).
     con.execute(f"""
         CREATE OR REPLACE TABLE fat_dia_semana AS
+        WITH regras AS (
+          SELECT escopo, escopo_id, dia_semana, ajuste_pct,
+                 CASE escopo
+                   WHEN 'predio' THEN 1
+                   WHEN 'regiao' THEN 2
+                   WHEN 'global' THEN 3
+                   ELSE 99
+                 END AS prio_escopo
+          FROM read_parquet({pq('regras_priori/regras_dia_semana/regras_dia_semana.parquet')})
+          WHERE COALESCE(ativo, TRUE) = TRUE
+            AND escopo IN ('global', 'regiao', 'predio')
+        ),
+        matched AS (
+          SELECT
+            ui.unidade_id,
+            c.data,
+            r.ajuste_pct,
+            ROW_NUMBER() OVER (
+              PARTITION BY ui.unidade_id, c.data
+              ORDER BY r.prio_escopo
+            ) AS rn
+          FROM unit_info ui
+          CROSS JOIN cal c
+          JOIN regras r
+            ON r.dia_semana = (isodow(c.data) - 1)
+            AND (
+              (r.escopo = 'predio' AND r.escopo_id = ui.predio_id)
+              OR (r.escopo = 'regiao' AND r.escopo_id = ui.regiao_id)
+              OR r.escopo = 'global'
+            )
+        )
         SELECT
           DATE '{TODAY}' AS data_referencia,
           ui.unidade_id,
           c.data,
-          COALESCE(SUM(r.ajuste_pct), 0.0)::DOUBLE AS ajuste_pct
+          COALESCE(m.ajuste_pct, 0.0)::DOUBLE AS ajuste_pct
         FROM unit_info ui
         CROSS JOIN cal c
-        LEFT JOIN read_parquet({pq('regras_priori/regras_dia_semana/regras_dia_semana.parquet')}) r
-          ON r.dia_semana = (isodow(c.data) - 1)
-          AND (
-            r.escopo = 'global'
-            OR (r.escopo = 'regiao'   AND r.escopo_id = ui.regiao_id)
-            OR (r.escopo = 'predio'   AND r.escopo_id = ui.predio_id)
-            OR (r.escopo = 'segmento' AND r.escopo_id = ui.segmento_id)
-            OR (r.escopo = 'unidade'  AND r.escopo_id = ui.unidade_id)
-          )
-        GROUP BY ui.unidade_id, c.data
+        LEFT JOIN matched m
+          ON m.unidade_id = ui.unidade_id AND m.data = c.data AND m.rn = 1
     """)
     print(f"fat_dia_semana        {count(con, 'fat_dia_semana'):>8} linhas")
 

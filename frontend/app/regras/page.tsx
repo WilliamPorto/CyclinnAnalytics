@@ -2,10 +2,11 @@
 
 import { useState } from "react";
 import SazonalidadeTab from "./sazonalidade";
+import DiaSemanaTab from "./dia_semana";
 
 const SUB_TABS: { key: string; label: string; enabled: boolean }[] = [
   { key: "sazonalidade", label: "Sazonalidade", enabled: true },
-  { key: "dia_semana", label: "Dia da semana", enabled: false },
+  { key: "dia_semana", label: "Dia da semana", enabled: true },
   { key: "eventos", label: "Eventos", enabled: false },
   { key: "antecedencia", label: "Antecedência", enabled: false },
 ];
@@ -53,6 +54,7 @@ export default function RegrasPage() {
 
       <div style={{ flex: 1, overflow: "hidden" }}>
         {activeTab === "sazonalidade" && <SazonalidadeTab />}
+        {activeTab === "dia_semana" && <DiaSemanaTab />}
       </div>
     </main>
   );

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 type Banda = {
   ocupacao_min_pct: number;
@@ -11,7 +12,6 @@ type Banda = {
 type Bucket = {
   janela_dias: number;
   bandas: Banda[];
-  ativo: boolean;
 };
 
 function fmtPct(v: number): string {
@@ -25,8 +25,9 @@ function fmtPctSimples(v: number): string {
   return Number.isInteger(p) ? `${p.toFixed(0)}%` : `${p.toFixed(1)}%`;
 }
 
-function labelBucket(j: number): string {
+function labelBucket(j: number, isLast: boolean = false): string {
   if (j === 0) return "no dia";
+  if (isLast) return `acima de ${j} dia${j === 1 ? "" : "s"}`;
   if (j === 1) return "1 dia";
   return `${j} dias`;
 }
@@ -143,7 +144,7 @@ export default function OcupacaoTab() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch("/api/regras/ocupacao-portfolio");
+      const r = await apiFetch("/api/regras/ocupacao-portfolio");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setBuckets(d.buckets ?? []);
@@ -164,7 +165,7 @@ export default function OcupacaoTab() {
       const url = isNew
         ? "/api/regras/ocupacao-portfolio/bucket"
         : `/api/regras/ocupacao-portfolio/bucket/${janelaOriginal}`;
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method: isNew ? "POST" : "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(shape),
@@ -181,21 +182,9 @@ export default function OcupacaoTab() {
     [fetchBuckets]
   );
 
-  const toggleAtivo = async (b: Bucket) => {
-    const r = await fetch(`/api/regras/ocupacao-portfolio/bucket/${b.janela_dias}/ativo`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ativo: !b.ativo }),
-    });
-    if (r.ok) {
-      setPendingChanges(true);
-      fetchBuckets();
-    }
-  };
-
   const deletarBucket = async (b: Bucket) => {
-    if (!confirm(`Apagar bucket "${labelBucket(b.janela_dias)}"?`)) return;
-    const r = await fetch(`/api/regras/ocupacao-portfolio/bucket/${b.janela_dias}`, {
+    if (!confirm(`Excluir bucket "${labelBucket(b.janela_dias)}"?`)) return;
+    const r = await apiFetch(`/api/regras/ocupacao-portfolio/bucket/${b.janela_dias}`, {
       method: "DELETE",
     });
     if (r.ok) {
@@ -208,7 +197,7 @@ export default function OcupacaoTab() {
     setRebuildState("running");
     setRebuildMsg("");
     try {
-      const r = await fetch("/api/regras/rebuild-simulador", { method: "POST" });
+      const r = await apiFetch("/api/regras/rebuild-simulador", { method: "POST" });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
       setRebuildState("ok");
@@ -264,28 +253,34 @@ export default function OcupacaoTab() {
           {error && <div style={{ color: "#dc2626" }}>{error}</div>}
 
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {buckets.map((b) => (
-              <BucketCard
-                key={b.janela_dias}
-                bucket={b}
-                expanded={expanded === b.janela_dias}
-                onToggleExpand={() =>
-                  setExpanded(expanded === b.janela_dias ? null : b.janela_dias)
-                }
-                onSave={(shape) => saveBucket(b.janela_dias, shape)}
-                onToggleAtivo={() => toggleAtivo(b)}
-                onDelete={() => deletarBucket(b)}
-              />
-            ))}
+            {buckets.map((b) => {
+              const maxJanela =
+                buckets.length > 0
+                  ? Math.max(...buckets.map((x) => x.janela_dias))
+                  : b.janela_dias;
+              return (
+                <BucketCard
+                  key={b.janela_dias}
+                  bucket={b}
+                  isLast={b.janela_dias === maxJanela}
+                  expanded={expanded === b.janela_dias}
+                  onToggleExpand={() =>
+                    setExpanded(expanded === b.janela_dias ? null : b.janela_dias)
+                  }
+                  onSave={(shape) => saveBucket(b.janela_dias, shape)}
+                  onDelete={() => deletarBucket(b)}
+                />
+              );
+            })}
 
             {adding && (
               <BucketCard
-                bucket={{ janela_dias: 0, bandas: [{ ocupacao_min_pct: 0, ocupacao_max_pct: 1, ajuste_pct: 0 }], ativo: true }}
+                bucket={{ janela_dias: 0, bandas: [{ ocupacao_min_pct: 0, ocupacao_max_pct: 1, ajuste_pct: 0 }] }}
+                isLast={false}
                 expanded
                 isNew
                 onToggleExpand={() => setAdding(false)}
                 onSave={(shape) => saveBucket(null, shape)}
-                onToggleAtivo={() => {}}
                 onDelete={() => setAdding(false)}
               />
             )}
@@ -309,19 +304,19 @@ export default function OcupacaoTab() {
 
 function BucketCard({
   bucket,
+  isLast,
   expanded,
   isNew = false,
   onToggleExpand,
   onSave,
-  onToggleAtivo,
   onDelete,
 }: {
   bucket: Bucket;
+  isLast: boolean;
   expanded: boolean;
   isNew?: boolean;
   onToggleExpand: () => void;
   onSave: (shape: Shape) => Promise<void>;
-  onToggleAtivo: () => void;
   onDelete: () => void;
 }) {
   const [shape, setShape] = useState<Shape>(bucketToShape(bucket));
@@ -373,7 +368,6 @@ function BucketCard({
         background: "#ffffff",
         border: "1px solid #e2e8f0",
         borderRadius: 6,
-        opacity: bucket.ativo ? 1 : 0.55,
       }}
     >
       <div
@@ -389,8 +383,8 @@ function BucketCard({
         <span style={{ fontSize: 12, color: "#64748b", minWidth: 14 }}>
           {expanded ? "▾" : "▸"}
         </span>
-        <div style={{ flex: "0 0 140px", fontWeight: 600, fontSize: 14, color: "#0f172a" }}>
-          {isNew ? "novo bucket" : labelBucket(bucket.janela_dias)}
+        <div style={{ flex: "0 0 180px", fontWeight: 600, fontSize: 14, color: "#0f172a" }}>
+          {isNew ? "novo bucket" : labelBucket(bucket.janela_dias, isLast)}
         </div>
         <div style={{ flex: 1, fontSize: 12, color: "#475569" }}>
           {isNew ? "preencha abaixo" : resumo}
@@ -402,17 +396,24 @@ function BucketCard({
           </div>
         )}
         {!isNew && (
-          <>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggleAtivo();
-              }}
-              style={{ ...btnSecondary, fontSize: 11, padding: "3px 10px" }}
-            >
-              {bucket.ativo ? "desativar" : "reativar"}
-            </button>
-          </>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            style={{
+              background: "#ffffff",
+              border: "1px solid #fca5a5",
+              borderRadius: 4,
+              padding: "3px 10px",
+              fontSize: 11,
+              cursor: "pointer",
+              color: "#b91c1c",
+              fontFamily: "inherit",
+            }}
+          >
+            excluir
+          </button>
         )}
       </div>
 
@@ -539,20 +540,11 @@ function BucketCard({
 
           {err && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 10 }}>{err}</div>}
 
-          <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 14 }}>
-            <div>
-              {!isNew && (
-                <button onClick={onDelete} style={{ ...btnSecondary, color: "#b91c1c", borderColor: "#fca5a5" }}>
-                  apagar bucket
-                </button>
-              )}
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={onToggleExpand} style={cancelBtn}>Cancelar</button>
-              <button onClick={submit} disabled={saving} style={btnPrimary}>
-                {saving ? "Salvando…" : isNew ? "Criar bucket" : "Salvar"}
-              </button>
-            </div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+            <button onClick={onToggleExpand} style={cancelBtn}>Cancelar</button>
+            <button onClick={submit} disabled={saving} style={btnPrimary}>
+              {saving ? "Salvando…" : isNew ? "Criar bucket" : "Salvar"}
+            </button>
           </div>
         </div>
       )}

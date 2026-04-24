@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 type Regra = {
   regra_id: number;
@@ -12,7 +13,6 @@ type Regra = {
   ajuste_pct: number;
   recorrente_anual: boolean;
   prioridade: number;
-  ativo: boolean;
 };
 
 type EscopoOpt = { id: number; nome: string };
@@ -112,9 +112,8 @@ export default function SazonalidadeTab() {
         escopo_id: r.escopo === "global" ? null : r.escopo_id ?? null,
         recorrente_anual: r.recorrente_anual ?? true,
         prioridade: r.prioridade ?? 10,
-        ...(isNew ? {} : { ativo: r.ativo ?? true }),
       };
-      const res = await fetch(
+      const res = await apiFetch(
         isNew
           ? "/api/regras/sazonalidade"
           : `/api/regras/sazonalidade/${r.regra_id}`,
@@ -135,15 +134,14 @@ export default function SazonalidadeTab() {
     [fetchRegras]
   );
 
-  const toggleAtivo = useCallback(
+  const excluirRegra = useCallback(
     async (r: Regra) => {
-      const res = await fetch(`/api/regras/sazonalidade/${r.regra_id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ativo: !r.ativo }),
+      if (!confirm(`Excluir a regra "${r.nome}"?`)) return;
+      const res = await apiFetch(`/api/regras/sazonalidade/${r.regra_id}`, {
+        method: "DELETE",
       });
       if (!res.ok) {
-        setError(`Falha ao alterar ativo: ${await res.text()}`);
+        setError(`Falha ao excluir: ${await res.text()}`);
         return;
       }
       setPendingChanges(true);
@@ -156,7 +154,7 @@ export default function SazonalidadeTab() {
     setRebuildState("running");
     setRebuildMsg("");
     try {
-      const r = await fetch("/api/regras/rebuild-simulador", { method: "POST" });
+      const r = await apiFetch("/api/regras/rebuild-simulador", { method: "POST" });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
       setRebuildState("ok");
@@ -167,8 +165,6 @@ export default function SazonalidadeTab() {
       setRebuildMsg(String(e));
     }
   }, []);
-
-  const regrasAtivas = useMemo(() => regras.filter((r) => r.ativo), [regras]);
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -252,7 +248,7 @@ export default function SazonalidadeTab() {
               hoveredId={hoveredId}
               onHover={setHoveredId}
               onEdit={(r) => setDrawerRegra(r)}
-              onToggleAtivo={toggleAtivo}
+              onExcluir={excluirRegra}
               escopoOpts={escopoOpts}
             />
           )}
@@ -270,7 +266,7 @@ export default function SazonalidadeTab() {
           <div style={{ fontSize: 11, letterSpacing: 0.5, color: "#64748b", fontWeight: 700, textTransform: "uppercase", marginBottom: 12 }}>
             Calendário anual (ano genérico)
           </div>
-          <MiniCalendario regras={regrasAtivas} hoveredId={hoveredId} />
+          <MiniCalendario regras={regras} hoveredId={hoveredId} />
         </aside>
       </div>
 
@@ -292,14 +288,14 @@ function ListaRegras({
   hoveredId,
   onHover,
   onEdit,
-  onToggleAtivo,
+  onExcluir,
   escopoOpts,
 }: {
   regras: Regra[];
   hoveredId: number | null;
   onHover: (id: number | null) => void;
   onEdit: (r: Regra) => void;
-  onToggleAtivo: (r: Regra) => void;
+  onExcluir: (r: Regra) => void;
   escopoOpts: Record<string, EscopoOpt[]>;
 }) {
   return (
@@ -334,7 +330,7 @@ function ListaRegras({
               onMouseEnter={() => onHover(r.regra_id)}
               onMouseLeave={() => onHover(null)}
               style={{
-                opacity: r.ativo ? (faded ? 0.35 : 1) : 0.45,
+                opacity: faded ? 0.35 : 1,
                 background: highlight ? "#eff6ff" : "transparent",
                 cursor: "pointer",
               }}
@@ -361,19 +357,19 @@ function ListaRegras({
               <td style={{ ...td, textAlign: "right" }}>{r.prioridade}</td>
               <td style={td} onClick={(e) => e.stopPropagation()}>
                 <button
-                  onClick={() => onToggleAtivo(r)}
+                  onClick={() => onExcluir(r)}
                   style={{
-                    background: r.ativo ? "#ffffff" : "#f1f5f9",
-                    border: "1px solid #cbd5e1",
+                    background: "#ffffff",
+                    border: "1px solid #fca5a5",
                     borderRadius: 4,
                     padding: "3px 10px",
                     fontSize: 11,
                     cursor: "pointer",
-                    color: r.ativo ? "#475569" : "#64748b",
+                    color: "#b91c1c",
                     fontFamily: "inherit",
                   }}
                 >
-                  {r.ativo ? "desativar" : "reativar"}
+                  excluir
                 </button>
               </td>
             </tr>

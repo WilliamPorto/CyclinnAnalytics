@@ -1,13 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 type EscopoTipo = "global" | "regiao" | "predio";
 type EscopoRow = {
   escopo: EscopoTipo;
   escopo_id: number | null;
   nome: string;
-  ativo: boolean;
   values: number[]; // 7 valores: seg,ter,qua,qui,sex,sab,dom
 };
 
@@ -56,7 +56,7 @@ export default function DiaSemanaTab() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch("/api/regras/dia-semana/matriz");
+      const r = await apiFetch("/api/regras/dia-semana/matriz");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setEscopos(d.escopos ?? []);
@@ -111,7 +111,7 @@ export default function DiaSemanaTab() {
     setEscopos(newEscopos);
     setEditing(null);
     try {
-      const res = await fetch("/api/regras/dia-semana/celula", {
+      const res = await apiFetch("/api/regras/dia-semana/celula", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -125,16 +125,17 @@ export default function DiaSemanaTab() {
       setPendingChanges(true);
     } catch (err) {
       setError(String(err));
-      fetchMatriz(); // reverte via refresh
+      fetchMatriz();
     }
   };
 
-  const toggleAtivo = async (e: EscopoRow) => {
+  const excluirEscopo = async (e: EscopoRow) => {
+    const label = e.escopo === "global" ? "Global" : e.nome;
+    if (!confirm(`Excluir o escopo "${label}"?`)) return;
     try {
-      const res = await fetch("/api/regras/dia-semana/escopo/ativo", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ escopo: e.escopo, escopo_id: e.escopo_id, ativo: !e.ativo }),
+      const id = e.escopo_id ?? "null";
+      const res = await apiFetch(`/api/regras/dia-semana/escopo/${e.escopo}/${id}`, {
+        method: "DELETE",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setPendingChanges(true);
@@ -148,7 +149,7 @@ export default function DiaSemanaTab() {
     if (newTipo !== "regiao" && newTipo !== "predio") return;
     if (newId === null) return;
     try {
-      const res = await fetch("/api/regras/dia-semana/escopo", {
+      const res = await apiFetch("/api/regras/dia-semana/escopo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ escopo: newTipo, escopo_id: newId }),
@@ -168,7 +169,7 @@ export default function DiaSemanaTab() {
 
   const criarGlobalSeFaltar = async () => {
     try {
-      const res = await fetch("/api/regras/dia-semana/escopo", {
+      const res = await apiFetch("/api/regras/dia-semana/escopo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ escopo: "global", escopo_id: null }),
@@ -188,7 +189,7 @@ export default function DiaSemanaTab() {
     setRebuildState("running");
     setRebuildMsg("");
     try {
-      const r = await fetch("/api/regras/rebuild-simulador", { method: "POST" });
+      const r = await apiFetch("/api/regras/rebuild-simulador", { method: "POST" });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
       setRebuildState("ok");
@@ -359,7 +360,7 @@ export default function DiaSemanaTab() {
             </thead>
             <tbody>
               {escopos.map((e, rowIdx) => (
-                <tr key={`${e.escopo}-${e.escopo_id ?? "null"}`} style={{ opacity: e.ativo ? 1 : 0.45 }}>
+                <tr key={`${e.escopo}-${e.escopo_id ?? "null"}`}>
                   <td
                     style={{
                       ...cellLabel,
@@ -404,13 +405,13 @@ export default function DiaSemanaTab() {
                     return (
                       <td
                         key={dow}
-                        onClick={() => e.ativo && startEdit(rowIdx, dow)}
+                        onClick={() => startEdit(rowIdx, dow)}
                         style={{
                           ...cellVal,
                           background: cellColor(v, vabs),
-                          cursor: e.ativo ? "pointer" : "not-allowed",
+                          cursor: "pointer",
                         }}
-                        title={e.ativo ? "Clique para editar" : "escopo inativo"}
+                        title="Clique para editar"
                       >
                         {fmtPct(v)}
                       </td>
@@ -418,19 +419,19 @@ export default function DiaSemanaTab() {
                   })}
                   <td style={cellAction}>
                     <button
-                      onClick={() => toggleAtivo(e)}
+                      onClick={() => excluirEscopo(e)}
                       style={{
-                        background: e.ativo ? "#ffffff" : "#f1f5f9",
-                        border: "1px solid #cbd5e1",
+                        background: "#ffffff",
+                        border: "1px solid #fca5a5",
                         borderRadius: 4,
                         padding: "3px 10px",
                         fontSize: 11,
                         cursor: "pointer",
-                        color: e.ativo ? "#475569" : "#64748b",
+                        color: "#b91c1c",
                         fontFamily: "inherit",
                       }}
                     >
-                      {e.ativo ? "desativar" : "reativar"}
+                      excluir
                     </button>
                   </td>
                 </tr>

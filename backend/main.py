@@ -11,16 +11,17 @@ Execução:
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import duckdb
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -434,6 +435,108 @@ def simulador_matrix(
 
 
 # ============================================================
+# Auditoria (log de operações mutáveis)
+# ============================================================
+
+AUDITORIA_PARQUET = (
+    DATA_ROOT / "auditoria" / "log_operacoes" / "log_operacoes.parquet"
+)
+USUARIO_PADRAO = "admin"
+
+
+def _get_usuario(x_usuario: Optional[str]) -> str:
+    """Lê o header X-Usuario ou cai no padrão 'admin'."""
+    if x_usuario and x_usuario.strip():
+        return x_usuario.strip()[:120]
+    return USUARIO_PADRAO
+
+
+def _read_auditoria_df() -> pd.DataFrame:
+    if not AUDITORIA_PARQUET.exists():
+        return pd.DataFrame(
+            columns=["log_id", "timestamp", "usuario", "operacao", "recurso", "recurso_id", "detalhes"]
+        )
+    return pd.read_parquet(AUDITORIA_PARQUET)
+
+
+def _write_auditoria_df(df: pd.DataFrame) -> None:
+    AUDITORIA_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    if not df.empty:
+        df = df.copy()
+        df["log_id"] = df["log_id"].astype("int64")
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        for col in ("usuario", "operacao", "recurso"):
+            df[col] = df[col].astype(str)
+    df.to_parquet(AUDITORIA_PARQUET, index=False)
+
+
+def log_operacao(
+    usuario: str,
+    operacao: str,
+    recurso: str,
+    recurso_id: Optional[str] = None,
+    detalhes: Optional[dict[str, Any]] = None,
+) -> None:
+    """Adiciona uma linha no log de auditoria."""
+    df = _read_auditoria_df()
+    next_id = int(df["log_id"].max()) + 1 if not df.empty else 1
+    nova = {
+        "log_id": next_id,
+        "timestamp": datetime.now(timezone.utc),
+        "usuario": usuario,
+        "operacao": operacao,
+        "recurso": recurso,
+        "recurso_id": str(recurso_id) if recurso_id is not None else None,
+        "detalhes": json.dumps(detalhes, default=str, ensure_ascii=False) if detalhes else None,
+    }
+    df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+    _write_auditoria_df(df)
+
+
+@app.get("/auditoria/operacoes")
+def listar_auditoria(
+    page: int = 1,
+    page_size: int = 50,
+    recurso: Optional[str] = None,
+    operacao: Optional[str] = None,
+    usuario: Optional[str] = None,
+) -> dict:
+    df = _read_auditoria_df()
+    if recurso:
+        df = df[df["recurso"].str.startswith(recurso)]
+    if operacao:
+        df = df[df["operacao"] == operacao]
+    if usuario:
+        df = df[df["usuario"] == usuario]
+
+    total = len(df)
+    df = df.sort_values("timestamp", ascending=False)
+    page = max(1, int(page))
+    page_size = max(1, min(500, int(page_size)))
+    offset = (page - 1) * page_size
+    slice_df = df.iloc[offset : offset + page_size]
+
+    items = []
+    for _, r in slice_df.iterrows():
+        ts = r["timestamp"]
+        items.append({
+            "log_id": int(r["log_id"]),
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "usuario": r["usuario"],
+            "operacao": r["operacao"],
+            "recurso": r["recurso"],
+            "recurso_id": None if pd.isna(r["recurso_id"]) else r["recurso_id"],
+            "detalhes": None if pd.isna(r["detalhes"]) else r["detalhes"],
+        })
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": items,
+    }
+
+
+# ============================================================
 # Regras — CRUD de sazonalidade (grava no parquet direto)
 # ============================================================
 
@@ -445,23 +548,21 @@ SIMULADOR_BUILD_SCRIPT = ROOT / "simulador" / "backend" / "build_simulator_db.py
 
 def _read_sazonalidade_df() -> pd.DataFrame:
     if not SAZONALIDADE_PARQUET.exists():
-        # Schema inicial vazio
         return pd.DataFrame(
             columns=[
                 "regra_id", "escopo", "escopo_id", "nome",
                 "data_inicio", "data_fim", "ajuste_pct",
-                "recorrente_anual", "prioridade", "ativo",
+                "recorrente_anual", "prioridade",
             ]
         )
     df = pd.read_parquet(SAZONALIDADE_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
 def _write_sazonalidade_df(df: pd.DataFrame) -> None:
     SAZONALIDADE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
-    # Normaliza tipos antes de salvar
     if not df.empty:
         df = df.copy()
         df["data_inicio"] = pd.to_datetime(df["data_inicio"]).dt.date
@@ -471,7 +572,6 @@ def _write_sazonalidade_df(df: pd.DataFrame) -> None:
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
         df["prioridade"] = df["prioridade"].astype("int64")
         df["recorrente_anual"] = df["recorrente_anual"].astype(bool)
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(SAZONALIDADE_PARQUET, index=False)
 
 
@@ -493,7 +593,6 @@ def _serialize_regra(row: pd.Series) -> dict:
         "ajuste_pct": float(row["ajuste_pct"]),
         "recorrente_anual": bool(row["recorrente_anual"]),
         "prioridade": int(row["prioridade"]),
-        "ativo": bool(row["ativo"]),
     }
 
 
@@ -517,7 +616,6 @@ class SazonalidadePatch(BaseModel):
     escopo_id: Optional[int] = None
     recorrente_anual: Optional[bool] = None
     prioridade: Optional[int] = None
-    ativo: Optional[bool] = None
 
 
 def _validar_datas(d_ini_s: str, d_fim_s: str) -> tuple[date, date]:
@@ -563,16 +661,17 @@ def _validar_escopo(escopo: str, escopo_id: Optional[int]) -> None:
 
 
 @app.get("/regras/sazonalidade")
-def listar_sazonalidade(incluir_inativas: bool = True) -> list[dict]:
+def listar_sazonalidade() -> list[dict]:
     df = _read_sazonalidade_df()
-    if not incluir_inativas:
-        df = df[df["ativo"]]
-    df = df.sort_values(["ativo", "data_inicio"], ascending=[False, True])
+    df = df.sort_values("data_inicio", ascending=True)
     return [_serialize_regra(r) for _, r in df.iterrows()]
 
 
 @app.post("/regras/sazonalidade", status_code=201)
-def criar_sazonalidade(body: SazonalidadeIn) -> dict:
+def criar_sazonalidade(
+    body: SazonalidadeIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     d_ini, d_fim = _validar_datas(body.data_inicio, body.data_fim)
     _validar_escopo(body.escopo, body.escopo_id)
 
@@ -589,15 +688,22 @@ def criar_sazonalidade(body: SazonalidadeIn) -> dict:
         "ajuste_pct": body.ajuste_pct,
         "recorrente_anual": body.recorrente_anual,
         "prioridade": body.prioridade,
-        "ativo": True,
     }
     df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
     _write_sazonalidade_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "create",
+        "regras.sazonalidade", str(next_id),
+        {"nome": body.nome, "ajuste_pct": body.ajuste_pct, "escopo": body.escopo},
+    )
     return _serialize_regra(pd.Series(nova))
 
 
 @app.patch("/regras/sazonalidade/{regra_id}")
-def editar_sazonalidade(regra_id: int, body: SazonalidadePatch) -> dict:
+def editar_sazonalidade(
+    regra_id: int, body: SazonalidadePatch,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_sazonalidade_df()
     mask = df["regra_id"] == regra_id
     if not mask.any():
@@ -627,7 +733,33 @@ def editar_sazonalidade(regra_id: int, body: SazonalidadePatch) -> dict:
         df.loc[mask, col] = val
 
     _write_sazonalidade_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "update",
+        "regras.sazonalidade", str(regra_id),
+        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in patch_dict.items()},
+    )
     return _serialize_regra(df[mask].iloc[0])
+
+
+@app.delete("/regras/sazonalidade/{regra_id}")
+def deletar_sazonalidade(
+    regra_id: int,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
+    df = _read_sazonalidade_df()
+    mask = df["regra_id"] == regra_id
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"regra {regra_id} não encontrada")
+    removida = df[mask].iloc[0]
+    nome = str(removida["nome"])
+    df = df[~mask].copy()
+    _write_sazonalidade_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "delete",
+        "regras.sazonalidade", str(regra_id),
+        {"nome": nome},
+    )
+    return {"ok": True}
 
 
 @app.get("/regras/escopo/{tipo}")
@@ -657,11 +789,11 @@ DIA_SEMANA_PARQUET = (
 def _read_dia_semana_df() -> pd.DataFrame:
     if not DIA_SEMANA_PARQUET.exists():
         return pd.DataFrame(
-            columns=["regra_id", "escopo", "escopo_id", "dia_semana", "ajuste_pct", "ativo"]
+            columns=["regra_id", "escopo", "escopo_id", "dia_semana", "ajuste_pct"]
         )
     df = pd.read_parquet(DIA_SEMANA_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
@@ -673,7 +805,6 @@ def _write_dia_semana_df(df: pd.DataFrame) -> None:
         df["escopo_id"] = df["escopo_id"].astype("Int64")
         df["dia_semana"] = df["dia_semana"].astype("int64")
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(DIA_SEMANA_PARQUET, index=False)
 
 
@@ -695,18 +826,15 @@ def matriz_dia_semana() -> dict:
     if not df.empty:
         for (escopo, esc_id), g in df.groupby(["escopo", "escopo_id"], dropna=False):
             values = [0.0] * 7
-            ativos = []
             for _, row in g.iterrows():
                 dow = int(row["dia_semana"])
                 if 0 <= dow < 7:
                     values[dow] = float(row["ajuste_pct"])
-                ativos.append(bool(row["ativo"]))
             grupos.append(
                 {
                     "escopo": escopo,
                     "escopo_id": None if pd.isna(esc_id) else int(esc_id),
                     "values": values,
-                    "ativo": all(ativos) if ativos else True,
                 }
             )
 
@@ -737,11 +865,13 @@ class NovoEscopoDiaSemana(BaseModel):
 
 
 @app.post("/regras/dia-semana/escopo", status_code=201)
-def criar_escopo_dia_semana(body: NovoEscopoDiaSemana) -> dict:
+def criar_escopo_dia_semana(
+    body: NovoEscopoDiaSemana,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     _validar_escopo(body.escopo, body.escopo_id)
 
     df = _read_dia_semana_df()
-    # Já existe?
     if body.escopo == "global":
         mask = df["escopo"] == "global"
     else:
@@ -751,7 +881,6 @@ def criar_escopo_dia_semana(body: NovoEscopoDiaSemana) -> dict:
             status_code=409, detail="Esse escopo já tem regras cadastradas"
         )
 
-    # Valores default: copia do global se existir; senão zeros
     global_rows = df[df["escopo"] == "global"]
     defaults = [0.0] * 7
     if not global_rows.empty:
@@ -763,24 +892,25 @@ def criar_escopo_dia_semana(body: NovoEscopoDiaSemana) -> dict:
     next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
     novas_rows = []
     for dow in range(7):
-        novas_rows.append(
-            {
-                "regra_id": next_id,
-                "escopo": body.escopo,
-                "escopo_id": body.escopo_id,
-                "dia_semana": dow,
-                "ajuste_pct": defaults[dow],
-                "ativo": True,
-            }
-        )
+        novas_rows.append({
+            "regra_id": next_id,
+            "escopo": body.escopo,
+            "escopo_id": body.escopo_id,
+            "dia_semana": dow,
+            "ajuste_pct": defaults[dow],
+        })
         next_id += 1
     df = pd.concat([df, pd.DataFrame(novas_rows)], ignore_index=True)
     _write_dia_semana_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "create",
+        "regras.dia_semana", f"{body.escopo}:{body.escopo_id or 'null'}",
+        {"values": defaults},
+    )
     return {
         "escopo": body.escopo,
         "escopo_id": body.escopo_id,
         "values": defaults,
-        "ativo": True,
     }
 
 
@@ -792,7 +922,10 @@ class CelulaDiaSemanaPatch(BaseModel):
 
 
 @app.patch("/regras/dia-semana/celula")
-def patch_celula_dia_semana(body: CelulaDiaSemanaPatch) -> dict:
+def patch_celula_dia_semana(
+    body: CelulaDiaSemanaPatch,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_dia_semana_df()
     if body.escopo == "global":
         mask = (df["escopo"] == "global") & (df["dia_semana"] == body.dia_semana)
@@ -803,51 +936,57 @@ def patch_celula_dia_semana(body: CelulaDiaSemanaPatch) -> dict:
             & (df["dia_semana"] == body.dia_semana)
         )
     if not mask.any():
-        # Cria a linha se não existe
         next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
         df = pd.concat(
             [
                 df,
-                pd.DataFrame(
-                    [
-                        {
-                            "regra_id": next_id,
-                            "escopo": body.escopo,
-                            "escopo_id": body.escopo_id,
-                            "dia_semana": body.dia_semana,
-                            "ajuste_pct": body.ajuste_pct,
-                            "ativo": True,
-                        }
-                    ]
-                ),
+                pd.DataFrame([{
+                    "regra_id": next_id,
+                    "escopo": body.escopo,
+                    "escopo_id": body.escopo_id,
+                    "dia_semana": body.dia_semana,
+                    "ajuste_pct": body.ajuste_pct,
+                }]),
             ],
             ignore_index=True,
         )
     else:
         df.loc[mask, "ajuste_pct"] = body.ajuste_pct
-        df.loc[mask, "ativo"] = True
     _write_dia_semana_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "update",
+        "regras.dia_semana",
+        f"{body.escopo}:{body.escopo_id or 'null'}:dow={body.dia_semana}",
+        {"ajuste_pct": body.ajuste_pct},
+    )
     return {"ok": True}
 
 
-class AtivoDiaSemanaPatch(BaseModel):
-    escopo: str = Field(..., pattern="^(global|regiao|predio)$")
-    escopo_id: Optional[int] = None
-    ativo: bool
-
-
-@app.patch("/regras/dia-semana/escopo/ativo")
-def toggle_ativo_dia_semana(body: AtivoDiaSemanaPatch) -> dict:
+@app.delete("/regras/dia-semana/escopo/{escopo}/{escopo_id}")
+def deletar_escopo_dia_semana(
+    escopo: str, escopo_id: str,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_dia_semana_df()
-    if body.escopo == "global":
+    if escopo == "global":
         mask = df["escopo"] == "global"
     else:
-        mask = (df["escopo"] == body.escopo) & (df["escopo_id"] == body.escopo_id)
+        try:
+            eid = int(escopo_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="escopo_id inválido")
+        mask = (df["escopo"] == escopo) & (df["escopo_id"] == eid)
     if not mask.any():
         raise HTTPException(status_code=404, detail="Escopo não encontrado")
-    df.loc[mask, "ativo"] = body.ativo
+    linhas_afetadas = int(mask.sum())
+    df = df[~mask].copy()
     _write_dia_semana_df(df)
-    return {"ok": True, "linhas_afetadas": int(mask.sum())}
+    log_operacao(
+        _get_usuario(x_usuario), "delete",
+        "regras.dia_semana", f"{escopo}:{escopo_id}",
+        {"linhas_removidas": linhas_afetadas},
+    )
+    return {"ok": True, "linhas_removidas": linhas_afetadas}
 
 
 # ─── Eventos (matriz evento × escopo) ──────────────────────────
@@ -861,11 +1000,11 @@ CATEGORIAS_EVENTO = {"esportivo", "show", "feriado", "convencao"}
 def _read_eventos_df() -> pd.DataFrame:
     if not EVENTOS_PARQUET.exists():
         return pd.DataFrame(
-            columns=["evento_id", "nome", "data_inicio", "data_fim", "categoria", "ativo"]
+            columns=["evento_id", "nome", "data_inicio", "data_fim", "categoria"]
         )
     df = pd.read_parquet(EVENTOS_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
@@ -876,18 +1015,17 @@ def _write_eventos_df(df: pd.DataFrame) -> None:
         df["evento_id"] = df["evento_id"].astype("int64")
         df["data_inicio"] = pd.to_datetime(df["data_inicio"]).dt.date
         df["data_fim"] = pd.to_datetime(df["data_fim"]).dt.date
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(EVENTOS_PARQUET, index=False)
 
 
 def _read_impactos_df() -> pd.DataFrame:
     if not IMPACTOS_PARQUET.exists():
         return pd.DataFrame(
-            columns=["impacto_id", "evento_id", "escopo", "escopo_id", "ajuste_pct", "ativo"]
+            columns=["impacto_id", "evento_id", "escopo", "escopo_id", "ajuste_pct"]
         )
     df = pd.read_parquet(IMPACTOS_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
@@ -899,7 +1037,6 @@ def _write_impactos_df(df: pd.DataFrame) -> None:
         df["evento_id"] = df["evento_id"].astype("int64")
         df["escopo_id"] = df["escopo_id"].astype("Int64")
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(IMPACTOS_PARQUET, index=False)
 
 
@@ -923,16 +1060,12 @@ def _nome_escopo_lookup(escopo: str, escopo_id: Optional[int]) -> str:
 
 
 @app.get("/regras/eventos/matriz")
-def matriz_eventos(incluir_inativos: bool = True) -> dict:
+def matriz_eventos() -> dict:
     eventos = _read_eventos_df()
     impactos = _read_impactos_df()
 
-    if not incluir_inativos:
-        eventos = eventos[eventos["ativo"]]
-
-    # Agrupa impactos por evento (só ativos)
     impactos_por_evento: dict[int, list[dict]] = {}
-    for _, imp in impactos[impactos["ativo"]].iterrows():
+    for _, imp in impactos.iterrows():
         eid = int(imp["evento_id"])
         impactos_por_evento.setdefault(eid, []).append(
             {
@@ -951,7 +1084,6 @@ def matriz_eventos(incluir_inativos: bool = True) -> dict:
                 "data_inicio": ev["data_inicio"].isoformat() if hasattr(ev["data_inicio"], "isoformat") else str(ev["data_inicio"]),
                 "data_fim": ev["data_fim"].isoformat() if hasattr(ev["data_fim"], "isoformat") else str(ev["data_fim"]),
                 "categoria": str(ev["categoria"]),
-                "ativo": bool(ev["ativo"]),
                 "impactos": impactos_por_evento.get(int(ev["evento_id"]), []),
             }
         )
@@ -983,7 +1115,6 @@ class EventoPatch(BaseModel):
     data_inicio: Optional[str] = None
     data_fim: Optional[str] = None
     categoria: Optional[str] = None
-    ativo: Optional[bool] = None
 
 
 def _validar_categoria(cat: str) -> None:
@@ -995,7 +1126,10 @@ def _validar_categoria(cat: str) -> None:
 
 
 @app.post("/regras/eventos", status_code=201)
-def criar_evento(body: EventoIn) -> dict:
+def criar_evento(
+    body: EventoIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     d_ini, d_fim = _validar_datas(body.data_inicio, body.data_fim)
     _validar_categoria(body.categoria)
 
@@ -1007,23 +1141,29 @@ def criar_evento(body: EventoIn) -> dict:
         "data_inicio": d_ini,
         "data_fim": d_fim,
         "categoria": body.categoria,
-        "ativo": True,
     }
     df = pd.concat([df, pd.DataFrame([novo])], ignore_index=True)
     _write_eventos_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "create",
+        "regras.eventos", str(next_id),
+        {"nome": body.nome, "categoria": body.categoria},
+    )
     return {
         "evento_id": next_id,
         "nome": body.nome,
         "data_inicio": d_ini.isoformat(),
         "data_fim": d_fim.isoformat(),
         "categoria": body.categoria,
-        "ativo": True,
         "impactos": [],
     }
 
 
 @app.patch("/regras/eventos/{evento_id}")
-def editar_evento(evento_id: int, body: EventoPatch) -> dict:
+def editar_evento(
+    evento_id: int, body: EventoPatch,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_eventos_df()
     mask = df["evento_id"] == evento_id
     if not mask.any():
@@ -1046,7 +1186,39 @@ def editar_evento(evento_id: int, body: EventoPatch) -> dict:
         df.loc[mask, col] = val
 
     _write_eventos_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "update",
+        "regras.eventos", str(evento_id),
+        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in patch.items()},
+    )
     return {"ok": True}
+
+
+@app.delete("/regras/eventos/{evento_id}")
+def deletar_evento(
+    evento_id: int,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
+    df_ev = _read_eventos_df()
+    mask = df_ev["evento_id"] == evento_id
+    if not mask.any():
+        raise HTTPException(status_code=404, detail=f"evento {evento_id} não encontrado")
+    nome = str(df_ev[mask].iloc[0]["nome"])
+    df_ev = df_ev[~mask].copy()
+    _write_eventos_df(df_ev)
+    # Remove também todos os impactos desse evento
+    df_imp = _read_impactos_df()
+    imp_mask = df_imp["evento_id"] == evento_id
+    impactos_removidos = int(imp_mask.sum())
+    if imp_mask.any():
+        df_imp = df_imp[~imp_mask].copy()
+        _write_impactos_df(df_imp)
+    log_operacao(
+        _get_usuario(x_usuario), "delete",
+        "regras.eventos", str(evento_id),
+        {"nome": nome, "impactos_removidos": impactos_removidos},
+    )
+    return {"ok": True, "impactos_removidos": impactos_removidos}
 
 
 class ImpactoPatch(BaseModel):
@@ -1056,8 +1228,10 @@ class ImpactoPatch(BaseModel):
 
 
 @app.patch("/regras/eventos/{evento_id}/impacto")
-def upsert_impacto(evento_id: int, body: ImpactoPatch) -> dict:
-    # Valida evento existe e ativo
+def upsert_impacto(
+    evento_id: int, body: ImpactoPatch,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     ev_df = _read_eventos_df()
     if not (ev_df["evento_id"] == evento_id).any():
         raise HTTPException(status_code=404, detail=f"evento {evento_id} não encontrado")
@@ -1074,17 +1248,22 @@ def upsert_impacto(evento_id: int, body: ImpactoPatch) -> dict:
         )
     )
 
-    # Ajuste zero → remove (desativa) o impacto
+    recurso_id = f"{evento_id}:{body.escopo}:{body.escopo_id or 'null'}"
+
+    # Ajuste zero → remove o impacto
     if abs(body.ajuste_pct) < 1e-6:
         if mask.any():
-            imp_df.loc[mask, "ativo"] = False
-        _write_impactos_df(imp_df)
+            imp_df = imp_df[~mask].copy()
+            _write_impactos_df(imp_df)
+        log_operacao(
+            _get_usuario(x_usuario), "delete",
+            "regras.eventos.impacto", recurso_id, None,
+        )
         return {"ok": True, "acao": "removido"}
 
     if mask.any():
         imp_df.loc[mask, "ajuste_pct"] = body.ajuste_pct
-        imp_df.loc[mask, "ativo"] = True
-        acao = "atualizado"
+        acao = "update"
     else:
         next_id = int(imp_df["impacto_id"].max()) + 1 if not imp_df.empty else 1
         novo = {
@@ -1093,12 +1272,16 @@ def upsert_impacto(evento_id: int, body: ImpactoPatch) -> dict:
             "escopo": body.escopo,
             "escopo_id": body.escopo_id,
             "ajuste_pct": body.ajuste_pct,
-            "ativo": True,
         }
         imp_df = pd.concat([imp_df, pd.DataFrame([novo])], ignore_index=True)
-        acao = "criado"
+        acao = "create"
 
     _write_impactos_df(imp_df)
+    log_operacao(
+        _get_usuario(x_usuario), acao,
+        "regras.eventos.impacto", recurso_id,
+        {"ajuste_pct": body.ajuste_pct},
+    )
     return {"ok": True, "acao": acao}
 
 
@@ -1115,12 +1298,12 @@ def _read_antecedencia_df() -> pd.DataFrame:
             columns=[
                 "regra_id", "escopo", "escopo_id",
                 "lead_min_dias", "lead_max_dias", "dia_semana",
-                "ajuste_pct", "ativo",
+                "ajuste_pct",
             ]
         )
     df = pd.read_parquet(ANTECEDENCIA_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
@@ -1133,7 +1316,6 @@ def _write_antecedencia_df(df: pd.DataFrame) -> None:
         df["lead_max_dias"] = df["lead_max_dias"].astype("int64")
         df["dia_semana"] = df["dia_semana"].astype("Int64")
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(ANTECEDENCIA_PARQUET, index=False)
 
 
@@ -1162,7 +1344,6 @@ def _serializar_faixas(df: pd.DataFrame) -> list[dict]:
             "por_dow": por_dow,
             "ajuste_uniforme": ajuste_uniforme,
             "ajustes_dow": ajustes_dow,
-            "ativo": bool(g["ativo"].all()),
         })
     out.sort(key=lambda f: f["lead_min_dias"])
     return out
@@ -1184,14 +1365,12 @@ def _calcular_gaps(faixas_ativas: list[dict], limite: int = 365) -> list[dict]:
 
 
 @app.get("/regras/antecedencia")
-def listar_antecedencia(incluir_inativas: bool = True) -> dict:
+def listar_antecedencia() -> dict:
     df = _read_antecedencia_df()
-    if not incluir_inativas:
-        df = df[df["ativo"]]
     if df.empty:
         return {"faixas": [], "gaps": [{"lead_min_dias": 0, "lead_max_dias": 365}]}
     faixas = _serializar_faixas(df)
-    gaps = _calcular_gaps([f for f in faixas if f["ativo"]])
+    gaps = _calcular_gaps(faixas)
     return {"faixas": faixas, "gaps": gaps}
 
 
@@ -1211,9 +1390,8 @@ def _checar_sobreposicao(
 ) -> None:
     if mn >= mx:
         raise HTTPException(status_code=400, detail="lead_min_dias deve ser < lead_max_dias")
-    ativas = df[df["ativo"]]
     faixas_existentes: set[tuple[int, int]] = set(
-        (int(a), int(b)) for a, b in zip(ativas["lead_min_dias"], ativas["lead_max_dias"])
+        (int(a), int(b)) for a, b in zip(df["lead_min_dias"], df["lead_max_dias"])
     )
     if ignorar_faixa is not None:
         faixas_existentes.discard(ignorar_faixa)
@@ -1243,7 +1421,6 @@ def _construir_linhas_faixa(
                 "lead_max_dias": body.lead_max_dias,
                 "dia_semana": i,
                 "ajuste_pct": float(vals[i]),
-                "ativo": True,
             })
             next_id += 1
     else:
@@ -1255,23 +1432,34 @@ def _construir_linhas_faixa(
             "lead_max_dias": body.lead_max_dias,
             "dia_semana": None,
             "ajuste_pct": float(body.ajuste_uniforme or 0),
-            "ativo": True,
         })
     return linhas
 
 
 @app.post("/regras/antecedencia/faixa", status_code=201)
-def criar_faixa_antecedencia(body: FaixaAntecedenciaIn) -> dict:
+def criar_faixa_antecedencia(
+    body: FaixaAntecedenciaIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_antecedencia_df()
     _checar_sobreposicao(df, body.lead_min_dias, body.lead_max_dias)
     linhas = _construir_linhas_faixa(df, body)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
     _write_antecedencia_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "create",
+        "regras.antecedencia",
+        f"{body.lead_min_dias}-{body.lead_max_dias}",
+        {"por_dow": body.por_dow, "ajuste_uniforme": body.ajuste_uniforme},
+    )
     return {"ok": True}
 
 
 @app.put("/regras/antecedencia/faixa/{lead_min}/{lead_max}")
-def atualizar_faixa_antecedencia(lead_min: int, lead_max: int, body: FaixaAntecedenciaIn) -> dict:
+def atualizar_faixa_antecedencia(
+    lead_min: int, lead_max: int, body: FaixaAntecedenciaIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_antecedencia_df()
     mask = (df["lead_min_dias"] == lead_min) & (df["lead_max_dias"] == lead_max)
     if not mask.any():
@@ -1280,27 +1468,38 @@ def atualizar_faixa_antecedencia(lead_min: int, lead_max: int, body: FaixaAntece
         df, body.lead_min_dias, body.lead_max_dias,
         ignorar_faixa=(lead_min, lead_max),
     )
-    # Remove linhas antigas da faixa e adiciona novas
     df = df[~mask].copy()
     linhas = _construir_linhas_faixa(df, body)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
     _write_antecedencia_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "update",
+        "regras.antecedencia",
+        f"{lead_min}-{lead_max}",
+        {"nova_faixa": f"{body.lead_min_dias}-{body.lead_max_dias}", "por_dow": body.por_dow},
+    )
     return {"ok": True}
 
 
-class AtivoAntecedenciaPatch(BaseModel):
-    ativo: bool
-
-
-@app.patch("/regras/antecedencia/faixa/{lead_min}/{lead_max}/ativo")
-def toggle_ativo_faixa_antecedencia(lead_min: int, lead_max: int, body: AtivoAntecedenciaPatch) -> dict:
+@app.delete("/regras/antecedencia/faixa/{lead_min}/{lead_max}")
+def deletar_faixa_antecedencia(
+    lead_min: int, lead_max: int,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_antecedencia_df()
     mask = (df["lead_min_dias"] == lead_min) & (df["lead_max_dias"] == lead_max)
     if not mask.any():
         raise HTTPException(status_code=404, detail="Faixa não encontrada")
-    df.loc[mask, "ativo"] = body.ativo
+    removidas = int(mask.sum())
+    df = df[~mask].copy()
     _write_antecedencia_df(df)
-    return {"ok": True, "linhas_afetadas": int(mask.sum())}
+    log_operacao(
+        _get_usuario(x_usuario), "delete",
+        "regras.antecedencia",
+        f"{lead_min}-{lead_max}",
+        {"linhas_removidas": removidas},
+    )
+    return {"ok": True, "linhas_removidas": removidas}
 
 
 # ─── Ocupação (portfólio) ─────────────────────────────────────
@@ -1316,12 +1515,12 @@ def _read_ocup_portfolio_df() -> pd.DataFrame:
             columns=[
                 "regra_id", "escopo", "escopo_id",
                 "janela_dias", "ocupacao_min_pct", "ocupacao_max_pct",
-                "ajuste_pct", "cumulativo", "ativo",
+                "ajuste_pct", "cumulativo",
             ]
         )
     df = pd.read_parquet(OCUP_PORTFOLIO_PARQUET)
-    if "ativo" not in df.columns:
-        df["ativo"] = True
+    if "ativo" in df.columns:
+        df = df.drop(columns=["ativo"])
     return df
 
 
@@ -1335,7 +1534,6 @@ def _write_ocup_portfolio_df(df: pd.DataFrame) -> None:
         df["ocupacao_min_pct"] = df["ocupacao_min_pct"].astype(float)
         df["ocupacao_max_pct"] = df["ocupacao_max_pct"].astype(float)
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
-        df["ativo"] = df["ativo"].astype(bool)
     df.to_parquet(OCUP_PORTFOLIO_PARQUET, index=False)
 
 
@@ -1355,7 +1553,6 @@ def _serializar_buckets_ocup(df: pd.DataFrame) -> list[dict]:
             {
                 "janela_dias": int(janela),
                 "bandas": bandas,
-                "ativo": bool(g["ativo"].all()),
             }
         )
     buckets.sort(key=lambda b: b["janela_dias"])
@@ -1363,10 +1560,8 @@ def _serializar_buckets_ocup(df: pd.DataFrame) -> list[dict]:
 
 
 @app.get("/regras/ocupacao-portfolio")
-def listar_ocupacao_portfolio(incluir_inativos: bool = True) -> dict:
+def listar_ocupacao_portfolio() -> dict:
     df = _read_ocup_portfolio_df()
-    if not incluir_inativos:
-        df = df[df["ativo"]]
     if df.empty:
         return {"buckets": []}
     return {"buckets": _serializar_buckets_ocup(df)}
@@ -1412,7 +1607,6 @@ def _bucket_para_linhas(body: BucketOcupIn, start_id: int) -> list[dict]:
                 "ocupacao_max_pct": pontos[i + 1],
                 "ajuste_pct": float(adj),
                 "cumulativo": True,
-                "ativo": True,
             }
         )
         next_id += 1
@@ -1420,7 +1614,10 @@ def _bucket_para_linhas(body: BucketOcupIn, start_id: int) -> list[dict]:
 
 
 @app.post("/regras/ocupacao-portfolio/bucket", status_code=201)
-def criar_bucket_ocup(body: BucketOcupIn) -> dict:
+def criar_bucket_ocup(
+    body: BucketOcupIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     _validar_bucket_ocup(body)
     df = _read_ocup_portfolio_df()
     if (df["janela_dias"] == body.janela_dias).any():
@@ -1429,73 +1626,76 @@ def criar_bucket_ocup(body: BucketOcupIn) -> dict:
     linhas = _bucket_para_linhas(body, next_id)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
     _write_ocup_portfolio_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "create",
+        "regras.ocupacao_portfolio", str(body.janela_dias),
+        {"limites": body.limites, "ajustes": body.ajustes},
+    )
     return {"ok": True}
 
 
 @app.put("/regras/ocupacao-portfolio/bucket/{janela_dias}")
-def atualizar_bucket_ocup(janela_dias: int, body: BucketOcupIn) -> dict:
+def atualizar_bucket_ocup(
+    janela_dias: int, body: BucketOcupIn,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     _validar_bucket_ocup(body)
+    df = _read_ocup_portfolio_df()
+
     if body.janela_dias != janela_dias:
-        # Permitir renomear janela: remove a antiga e grava a nova
-        df = _read_ocup_portfolio_df()
         if not (df["janela_dias"] == janela_dias).any():
             raise HTTPException(status_code=404, detail="Bucket não encontrado")
         if (df["janela_dias"] == body.janela_dias).any():
             raise HTTPException(status_code=409, detail=f"Bucket {body.janela_dias} já existe")
         df = df[df["janela_dias"] != janela_dias].copy()
-        next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
-        linhas = _bucket_para_linhas(body, next_id)
-        df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
-        _write_ocup_portfolio_df(df)
-        return {"ok": True}
+    else:
+        mask = df["janela_dias"] == janela_dias
+        if not mask.any():
+            raise HTTPException(status_code=404, detail="Bucket não encontrado")
+        df = df[~mask].copy()
 
-    df = _read_ocup_portfolio_df()
-    mask = df["janela_dias"] == janela_dias
-    if not mask.any():
-        raise HTTPException(status_code=404, detail="Bucket não encontrado")
-    df = df[~mask].copy()
     next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
     linhas = _bucket_para_linhas(body, next_id)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
     _write_ocup_portfolio_df(df)
+    log_operacao(
+        _get_usuario(x_usuario), "update",
+        "regras.ocupacao_portfolio", str(janela_dias),
+        {"nova_janela": body.janela_dias, "limites": body.limites, "ajustes": body.ajustes},
+    )
     return {"ok": True}
-
-
-class AtivoOcupPatch(BaseModel):
-    ativo: bool
-
-
-@app.patch("/regras/ocupacao-portfolio/bucket/{janela_dias}/ativo")
-def toggle_ativo_bucket_ocup(janela_dias: int, body: AtivoOcupPatch) -> dict:
-    df = _read_ocup_portfolio_df()
-    mask = df["janela_dias"] == janela_dias
-    if not mask.any():
-        raise HTTPException(status_code=404, detail="Bucket não encontrado")
-    df.loc[mask, "ativo"] = body.ativo
-    _write_ocup_portfolio_df(df)
-    return {"ok": True, "linhas_afetadas": int(mask.sum())}
 
 
 @app.delete("/regras/ocupacao-portfolio/bucket/{janela_dias}")
-def deletar_bucket_ocup(janela_dias: int) -> dict:
+def deletar_bucket_ocup(
+    janela_dias: int,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     df = _read_ocup_portfolio_df()
     mask = df["janela_dias"] == janela_dias
     if not mask.any():
         raise HTTPException(status_code=404, detail="Bucket não encontrado")
+    removidas = int(mask.sum())
     df = df[~mask].copy()
     _write_ocup_portfolio_df(df)
-    return {"ok": True}
+    log_operacao(
+        _get_usuario(x_usuario), "delete",
+        "regras.ocupacao_portfolio", str(janela_dias),
+        {"linhas_removidas": removidas},
+    )
+    return {"ok": True, "linhas_removidas": removidas}
 
 
 @app.post("/regras/rebuild-simulador")
-def rebuild_simulador() -> dict:
+def rebuild_simulador(
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
     """Regenera o simulador.duckdb a partir dos parquets atualizados."""
     if not SIMULADOR_BUILD_SCRIPT.exists():
         raise HTTPException(
             status_code=500,
             detail=f"script não encontrado: {SIMULADOR_BUILD_SCRIPT}",
         )
-    # Fecha a conexão do simulador anexado antes de rebuildar o arquivo
     global CON
     CON.close()
     t0 = time.perf_counter()
@@ -1512,10 +1712,20 @@ def rebuild_simulador() -> dict:
     duration_ms = int((time.perf_counter() - t0) * 1000)
     CON = build_duckdb()
     if result.returncode != 0:
+        log_operacao(
+            _get_usuario(x_usuario), "rebuild_simulador_erro",
+            "sistema", None,
+            {"duration_ms": duration_ms, "erro": result.stderr[-500:]},
+        )
         raise HTTPException(
             status_code=500,
             detail=f"falha no rebuild: {result.stderr[-500:]}",
         )
+    log_operacao(
+        _get_usuario(x_usuario), "rebuild_simulador",
+        "sistema", None,
+        {"duration_ms": duration_ms},
+    )
     return {
         "ok": True,
         "duration_ms": duration_ms,

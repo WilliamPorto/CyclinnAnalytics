@@ -3,12 +3,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 const TABS: { key: string; label: string }[] = [
-  { key: "pb", label: "pb" },
-  { key: "pi", label: "pi" },
+  { key: "pb", label: "Preço Base" },
+  { key: "pi", label: "Preço Inicial" },
   { key: "expectativa_portfolio", label: "Ocupação esperada" },
   { key: "ocupacao_portfolio", label: "Ocupação real" },
   { key: "gap_ocupacao", label: "Gap (real − esperada)" },
-  { key: "d", label: "d (final)" },
+  { key: "d", label: "Preço Final" },
 ];
 
 // Abas que só fazem sentido na view "Por portfólio"

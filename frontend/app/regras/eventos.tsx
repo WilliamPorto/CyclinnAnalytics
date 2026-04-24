@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 type EscopoTipo = "global" | "regiao" | "predio" | "unidade";
 type Categoria = "esportivo" | "show" | "feriado" | "convencao";
@@ -17,7 +18,6 @@ type Evento = {
   data_inicio: string;
   data_fim: string;
   categoria: Categoria;
-  ativo: boolean;
   impactos: Impacto[];
 };
 
@@ -73,7 +73,6 @@ export default function EventosTab() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [openEditOnSelect, setOpenEditOnSelect] = useState(false);
   const [busca, setBusca] = useState("");
-  const [mostrarInativos, setMostrarInativos] = useState(true);
   const [opts, setOpts] = useState<Record<string, EscopoOpt[]>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -85,16 +84,15 @@ export default function EventosTab() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch("/api/regras/eventos/matriz");
+      const r = await apiFetch("/api/regras/eventos/matriz");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setEventos(d.eventos ?? []);
-      // Auto-select first active if none selected
       setSelectedId((curr) => {
         if (curr !== null && (d.eventos ?? []).some((e: Evento) => e.evento_id === curr)) {
           return curr;
         }
-        const first = (d.eventos ?? []).find((e: Evento) => e.ativo);
+        const first = (d.eventos ?? [])[0];
         return first?.evento_id ?? null;
       });
     } catch (e) {
@@ -111,7 +109,7 @@ export default function EventosTab() {
   const loadOptsSe = useCallback(
     async (tipo: string) => {
       if (opts[tipo] || tipo === "global") return;
-      const r = await fetch(`/api/regras/escopo/${tipo}`);
+      const r = await apiFetch(`/api/regras/escopo/${tipo}`);
       const d = await r.json();
       setOpts((s) => ({ ...s, [tipo]: d }));
     },
@@ -126,7 +124,6 @@ export default function EventosTab() {
 
   const eventosFiltrados = useMemo(() => {
     let arr = eventos;
-    if (!mostrarInativos) arr = arr.filter((e) => e.ativo);
     if (busca.trim()) {
       const q = busca.trim().toLowerCase();
       arr = arr.filter(
@@ -134,7 +131,7 @@ export default function EventosTab() {
       );
     }
     return arr;
-  }, [eventos, busca, mostrarInativos]);
+  }, [eventos, busca]);
 
   const selected = eventos.find((e) => e.evento_id === selectedId) ?? null;
 
@@ -145,9 +142,8 @@ export default function EventosTab() {
       data_inicio: form.data_inicio ?? "",
       data_fim: form.data_fim ?? "",
       categoria: form.categoria ?? "feriado",
-      ...(isNew ? {} : { ativo: form.ativo ?? true }),
     };
-    const res = await fetch(
+    const res = await apiFetch(
       isNew ? "/api/regras/eventos" : `/api/regras/eventos/${form.evento_id}`,
       {
         method: isNew ? "POST" : "PATCH",
@@ -169,15 +165,17 @@ export default function EventosTab() {
     }
   };
 
-  const toggleAtivoEvento = async (ev: Evento) => {
-    const res = await fetch(`/api/regras/eventos/${ev.evento_id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ativo: !ev.ativo }),
+  const excluirEvento = async (ev: Evento) => {
+    if (!confirm(`Excluir o evento "${ev.nome}"?`)) return;
+    const res = await apiFetch(`/api/regras/eventos/${ev.evento_id}`, {
+      method: "DELETE",
     });
     if (res.ok) {
       setPendingChanges(true);
+      setSelectedId(null);
       fetchMatriz();
+    } else {
+      setError(`Falha ao excluir: ${await res.text()}`);
     }
   };
 
@@ -204,7 +202,7 @@ export default function EventosTab() {
     escopo_id: number | null,
     ajuste_pct: number
   ) => {
-    const res = await fetch(`/api/regras/eventos/${evento_id}/impacto`, {
+    const res = await apiFetch(`/api/regras/eventos/${evento_id}/impacto`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ escopo, escopo_id, ajuste_pct }),
@@ -224,7 +222,7 @@ export default function EventosTab() {
     setRebuildState("running");
     setRebuildMsg("");
     try {
-      const r = await fetch("/api/regras/rebuild-simulador", { method: "POST" });
+      const r = await apiFetch("/api/regras/rebuild-simulador", { method: "POST" });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
       setRebuildState("ok");
@@ -293,14 +291,6 @@ export default function EventosTab() {
               onChange={(e) => setBusca(e.target.value)}
               style={{ ...inp, flex: 1 }}
             />
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#64748b", whiteSpace: "nowrap" }}>
-              <input
-                type="checkbox"
-                checked={mostrarInativos}
-                onChange={(e) => setMostrarInativos(e.target.checked)}
-              />
-              mostrar inativos
-            </label>
           </div>
 
           {/* Cabeçalho das colunas */}
@@ -354,7 +344,6 @@ export default function EventosTab() {
                     padding: "10px 11px",
                     cursor: "pointer",
                     fontFamily: "inherit",
-                    opacity: ev.ativo ? 1 : 0.5,
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
@@ -413,7 +402,7 @@ export default function EventosTab() {
               openEditOnMount={openEditOnSelect}
               onEditOpened={() => setOpenEditOnSelect(false)}
               onSave={saveEvento}
-              onToggleAtivo={toggleAtivoEvento}
+              onExcluir={excluirEvento}
               onUpsertImpacto={upsertImpacto}
               onRemoverImpacto={removerImpacto}
             />
@@ -447,7 +436,7 @@ export default function EventosTab() {
           Calendário anual — eventos ativos (por categoria)
         </div>
         <MiniCalendario
-          eventos={eventos.filter((e) => e.ativo)}
+          eventos={eventos}
           selectedId={selectedId}
         />
       </div>
@@ -462,7 +451,7 @@ function EventoDetalhe({
   openEditOnMount,
   onEditOpened,
   onSave,
-  onToggleAtivo,
+  onExcluir,
   onUpsertImpacto,
   onRemoverImpacto,
 }: {
@@ -472,7 +461,7 @@ function EventoDetalhe({
   openEditOnMount?: boolean;
   onEditOpened?: () => void;
   onSave: (e: Partial<Evento>) => Promise<void>;
-  onToggleAtivo: (e: Evento) => void;
+  onExcluir: (e: Evento) => void;
   onUpsertImpacto: (evId: number, esc: EscopoTipo, escId: number | null, v: number) => Promise<void>;
   onRemoverImpacto: (e: Evento, imp: Impacto) => Promise<void>;
 }) {
@@ -546,21 +535,6 @@ function EventoDetalhe({
       {/* Metadata header */}
       <div style={{ padding: "18px 22px", borderBottom: "1px solid #e2e8f0" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
-          {!evento.ativo && (
-            <span
-              style={{
-                background: "#fee2e2",
-                color: "#991b1b",
-                padding: "1px 8px",
-                borderRadius: 10,
-                fontSize: 10,
-                fontWeight: 700,
-                textTransform: "uppercase",
-              }}
-            >
-              inativo
-            </span>
-          )}
           <h2
             onClick={() => !editMeta && setEditMeta(true)}
             title={!editMeta ? "Clique para editar" : undefined}
@@ -575,10 +549,19 @@ function EventoDetalhe({
             {evento.nome}
           </h2>
           <button
-            onClick={() => onToggleAtivo(evento)}
-            style={{ ...btnSecondary, fontSize: 11, padding: "4px 10px" }}
+            onClick={() => onExcluir(evento)}
+            style={{
+              background: "#ffffff",
+              border: "1px solid #fca5a5",
+              color: "#b91c1c",
+              padding: "4px 10px",
+              borderRadius: 5,
+              fontSize: 11,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
           >
-            {evento.ativo ? "desativar" : "reativar"}
+            excluir
           </button>
           {!editMeta && (
             <button
@@ -677,7 +660,7 @@ function EventoDetalhe({
             Impactos ({evento.impactos.length})
           </div>
           <div style={{ flex: 1 }} />
-          {!addingImpacto && evento.ativo && (
+          {!addingImpacto && (
             <button onClick={() => setAddingImpacto(true)} style={{ ...btnPrimary, padding: "4px 12px", fontSize: 12 }}>
               + adicionar impacto
             </button>
@@ -726,8 +709,8 @@ function EventoDetalhe({
                     </td>
                     <td style={tdCell}>{nomeEscopo(imp, opts)}</td>
                     <td
-                      style={{ ...tdCell, textAlign: "right", fontVariantNumeric: "tabular-nums", cursor: evento.ativo ? "pointer" : "default" }}
-                      onClick={() => evento.ativo && !isEditing && startEditImpacto(imp)}
+                      style={{ ...tdCell, textAlign: "right", fontVariantNumeric: "tabular-nums", cursor: "pointer" }}
+                      onClick={() => !isEditing && startEditImpacto(imp)}
                     >
                       {isEditing ? (
                         <input

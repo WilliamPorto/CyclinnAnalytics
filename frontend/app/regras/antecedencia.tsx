@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../lib/api";
 
 type Faixa = {
   lead_min_dias: number;
@@ -8,7 +9,6 @@ type Faixa = {
   por_dow: boolean;
   ajuste_uniforme: number | null;
   ajustes_dow: number[] | null;
-  ativo: boolean;
 };
 
 type Gap = { lead_min_dias: number; lead_max_dias: number };
@@ -74,7 +74,7 @@ export default function AntecedenciaTab() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch("/api/regras/antecedencia");
+      const r = await apiFetch("/api/regras/antecedencia");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setFaixas(d.faixas ?? []);
@@ -92,13 +92,13 @@ export default function AntecedenciaTab() {
 
   const saveFaixa = async (
     originalKey: { lead_min: number; lead_max: number } | null, // null = criar
-    body: Omit<Faixa, "ativo">
+    body: Faixa
   ) => {
     const isNew = originalKey === null;
     const url = isNew
       ? "/api/regras/antecedencia/faixa"
       : `/api/regras/antecedencia/faixa/${originalKey.lead_min}/${originalKey.lead_max}`;
-    const res = await fetch(url, {
+    const res = await apiFetch(url, {
       method: isNew ? "POST" : "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -113,18 +113,18 @@ export default function AntecedenciaTab() {
     await fetchFaixas();
   };
 
-  const toggleAtivo = async (f: Faixa) => {
-    const res = await fetch(
-      `/api/regras/antecedencia/faixa/${f.lead_min_dias}/${f.lead_max_dias}/ativo`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ativo: !f.ativo }),
-      }
+  const excluirFaixa = async (f: Faixa) => {
+    const label = `${f.lead_min_dias}–${f.lead_max_dias} dias`;
+    if (!confirm(`Excluir a faixa "${label}"?`)) return;
+    const res = await apiFetch(
+      `/api/regras/antecedencia/faixa/${f.lead_min_dias}/${f.lead_max_dias}`,
+      { method: "DELETE" }
     );
     if (res.ok) {
       setPendingChanges(true);
       fetchFaixas();
+    } else {
+      setError(`Falha ao excluir: ${await res.text()}`);
     }
   };
 
@@ -132,7 +132,7 @@ export default function AntecedenciaTab() {
     setRebuildState("running");
     setRebuildMsg("");
     try {
-      const r = await fetch("/api/regras/rebuild-simulador", { method: "POST" });
+      const r = await apiFetch("/api/regras/rebuild-simulador", { method: "POST" });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
       setRebuildState("ok");
@@ -225,7 +225,7 @@ export default function AntecedenciaTab() {
                       body
                     )
                   }
-                  onToggleAtivo={() => toggleAtivo(f)}
+                  onExcluir={() => excluirFaixa(f)}
                 />
               );
             })}
@@ -238,20 +238,19 @@ export default function AntecedenciaTab() {
                   por_dow: false,
                   ajuste_uniforme: 0,
                   ajustes_dow: null,
-                  ativo: true,
                 }}
                 expanded
                 isNew
                 onExpand={() => setAdding(false)}
                 onSave={(body) => saveFaixa(null, body)}
-                onToggleAtivo={() => {}}
+                onExcluir={() => setAdding(false)}
               />
             )}
           </div>
 
           {/* Timeline visual — abaixo dos cards */}
           <div style={{ marginTop: 32 }}>
-            <Timeline faixas={faixas.filter((f) => f.ativo)} gaps={gaps} />
+            <Timeline faixas={faixas} gaps={gaps} />
           </div>
 
           <div style={{ marginTop: 24, fontSize: 11, color: "#64748b", lineHeight: 1.5 }}>
@@ -518,14 +517,14 @@ function FaixaCard({
   isNew = false,
   onExpand,
   onSave,
-  onToggleAtivo,
+  onExcluir,
 }: {
   faixa: Faixa;
   expanded: boolean;
   isNew?: boolean;
   onExpand: () => void;
-  onSave: (body: Omit<Faixa, "ativo">) => Promise<void>;
-  onToggleAtivo: () => void;
+  onSave: (body: Faixa) => Promise<void>;
+  onExcluir: () => void;
 }) {
   const [form, setForm] = useState<Faixa>(faixa);
   const [saving, setSaving] = useState(false);
@@ -584,10 +583,8 @@ function FaixaCard({
         background: "#ffffff",
         border: "1px solid #e2e8f0",
         borderRadius: 6,
-        opacity: faixa.ativo ? 1 : 0.55,
       }}
     >
-      {/* Header da faixa */}
       <div
         style={{
           padding: "10px 14px",
@@ -611,11 +608,20 @@ function FaixaCard({
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onToggleAtivo();
+              onExcluir();
             }}
-            style={{ ...btnSecondary, fontSize: 11, padding: "3px 10px" }}
+            style={{
+              background: "#ffffff",
+              border: "1px solid #fca5a5",
+              borderRadius: 4,
+              padding: "3px 10px",
+              fontSize: 11,
+              cursor: "pointer",
+              color: "#b91c1c",
+              fontFamily: "inherit",
+            }}
           >
-            {faixa.ativo ? "desativar" : "reativar"}
+            excluir
           </button>
         )}
       </div>

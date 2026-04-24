@@ -54,8 +54,9 @@ export function NavBar() {
         Cyclinn Pricing
       </span>
       {link("/", "SQL Explorer")}
-      {link("/dashboards", "Dashboards")}
+      {link("/precificacao", "Precificação")}
       {link("/regras", "Regras")}
+      {link("/auditoria", "Auditoria")}
     </nav>
   );
 }

@@ -126,8 +126,7 @@ def main() -> None:
                    ELSE 99
                  END AS prio_escopo
           FROM read_parquet({pq('regras_priori/regras_dia_semana/regras_dia_semana.parquet')})
-          WHERE COALESCE(ativo, TRUE) = TRUE
-            AND escopo IN ('global', 'regiao', 'predio')
+          WHERE escopo IN ('global', 'regiao', 'predio')
         ),
         matched AS (
           SELECT
@@ -169,8 +168,7 @@ def main() -> None:
         WITH eventos_ativos AS (
           SELECT evento_id, data_inicio, data_fim
           FROM read_parquet({pq('regras_priori/eventos/eventos.parquet')})
-          WHERE COALESCE(ativo, TRUE) = TRUE
-        ),
+                  ),
         impactos_ativos AS (
           SELECT evento_id, escopo, escopo_id, ajuste_pct,
                  CASE escopo
@@ -181,8 +179,7 @@ def main() -> None:
                    ELSE 99
                  END AS prio_escopo
           FROM read_parquet({pq('regras_priori/evento_impactos/evento_impactos.parquet')})
-          WHERE COALESCE(ativo, TRUE) = TRUE
-        ),
+                  ),
         matches AS (
           SELECT
             ui.unidade_id,
@@ -226,8 +223,7 @@ def main() -> None:
           SELECT lead_min_dias, lead_max_dias, dia_semana, ajuste_pct,
                  CASE WHEN dia_semana IS NULL THEN 2 ELSE 1 END AS prio
           FROM read_parquet({pq('regras_priori/regras_antecedencia/regras_antecedencia.parquet')})
-          WHERE COALESCE(ativo, TRUE) = TRUE
-        ),
+                  ),
         matched AS (
           SELECT
             ui.unidade_id,
@@ -265,8 +261,7 @@ def main() -> None:
         WITH regras AS (
           SELECT janela_dias, ocupacao_min_pct, ocupacao_max_pct, ajuste_pct
           FROM read_parquet({pq('regras_posteriori/regras_ocupacao_portfolio/regras_ocupacao_portfolio.parquet')})
-          WHERE COALESCE(ativo, TRUE) = TRUE
-        ),
+                  ),
         janelas AS (
           SELECT DISTINCT janela_dias FROM regras
         ),

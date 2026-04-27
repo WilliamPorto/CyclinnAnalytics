@@ -6,22 +6,23 @@ import { apiFetch } from "../lib/api";
 const TABS: { key: string; label: string }[] = [
   { key: "pb", label: "Preço Base" },
   { key: "pi", label: "Preço Inicial" },
-  { key: "expectativa_portfolio", label: "Ocupação esperada" },
-  { key: "ocupacao_portfolio", label: "Ocupação real" },
+  { key: "expectativa_regiao", label: "Ocupação esperada" },
+  { key: "ocupacao_regiao", label: "Ocupação real" },
   { key: "d", label: "Preço Final" },
 ];
 
-// Abas que só fazem sentido na view "Por portfólio"
-const PORTFOLIO_ONLY_TABS = new Set([
-  "expectativa_portfolio",
-  "ocupacao_portfolio",
+// Abas que só fazem sentido em views agregadas (região ou prédio),
+// já que não existe ocupação por unidade individual no modelo.
+const AGGREGATED_ONLY_TABS = new Set([
+  "expectativa_regiao",
+  "ocupacao_regiao",
 ]);
 
 // Label contextual do "delta" mostrado no tooltip quando há color_values
 const COLOR_DELTA_LABEL: Record<string, string> = {
   pi: "vs Pb",
   d: "vs Pb",
-  ocupacao_portfolio: "vs esperada",
+  ocupacao_regiao: "vs esperada",
 };
 
 type Matrix = {
@@ -30,7 +31,7 @@ type Matrix = {
   data_inicio: string;
   data_fim: string;
   format: "currency" | "percent";
-  row_type: "unidade" | "portfolio";
+  row_type: "unidade" | "regiao" | "predio";
   columns: string[];
   rows: {
     id: number;
@@ -83,8 +84,8 @@ function formatValue(
 
 // Tabelas de ocupação (sempre positivo): mostra % sem sinal "+"
 const TABLES_UNSIGNED_PCT = new Set([
-  "ocupacao_portfolio",
-  "expectativa_portfolio",
+  "ocupacao_regiao",
+  "expectativa_regiao",
 ]);
 
 function cellColor(
@@ -156,7 +157,7 @@ export default function DashboardsPage() {
   const [activeTab, setActiveTab] = useState<string>(TABS[0].key);
   const [pageSize, setPageSize] = useState<number>(25);
   const [page, setPage] = useState<number>(1);
-  const [view, setView] = useState<"unidade" | "portfolio">("unidade");
+  const [view, setView] = useState<"unidade" | "regiao" | "predio">("unidade");
   const [matrix, setMatrix] = useState<Matrix | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -183,10 +184,11 @@ export default function DashboardsPage() {
     setPage(1);
   }, [dataRef, dataInicio, dataFim, activeTab, pageSize, view]);
 
-  // Força view=portfolio nas abas que só fazem sentido nessa granularidade
+  // Em abas agregadas (ocupação), se a view atual for "unidade", força "regiao"
+  // (mantém "predio" se já estiver, pois agora também é granularidade válida).
   useEffect(() => {
-    if (PORTFOLIO_ONLY_TABS.has(activeTab) && view !== "portfolio") {
-      setView("portfolio");
+    if (AGGREGATED_ONLY_TABS.has(activeTab) && view === "unidade") {
+      setView("regiao");
     }
   }, [activeTab, view]);
 
@@ -270,10 +272,16 @@ export default function DashboardsPage() {
               background: "#ffffff",
             }}
           >
-            {(["unidade", "portfolio"] as const).map((v) => {
+            {(["unidade", "predio", "regiao"] as const).map((v) => {
               const active = view === v;
               const disabled =
-                v === "unidade" && PORTFOLIO_ONLY_TABS.has(activeTab);
+                v === "unidade" && AGGREGATED_ONLY_TABS.has(activeTab);
+              const label =
+                v === "unidade"
+                  ? "Por unidade"
+                  : v === "predio"
+                  ? "Por prédio"
+                  : "Por região";
               return (
                 <button
                   key={v}
@@ -281,7 +289,7 @@ export default function DashboardsPage() {
                   disabled={disabled}
                   title={
                     disabled
-                      ? "Esta aba só faz sentido na visão por portfólio"
+                      ? "Esta aba não tem dado em granularidade de unidade"
                       : undefined
                   }
                   style={{
@@ -299,7 +307,7 @@ export default function DashboardsPage() {
                     cursor: disabled ? "not-allowed" : "pointer",
                   }}
                 >
-                  {v === "unidade" ? "Por unidade" : "Por portfólio"}
+                  {label}
                 </button>
               );
             })}
@@ -367,7 +375,7 @@ export default function DashboardsPage() {
           <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} style={btn}>Próxima ›</button>
           <button onClick={() => setPage(totalPages)} disabled={page >= totalPages} style={btn}>Última »</button>
           <span style={{ marginLeft: 12 }}>
-            {matrix.total_rows} {matrix.row_type === "unidade" ? "unidades" : "portfólios"} · {matrix.columns.length} dias
+            {matrix.total_rows} {matrix.row_type === "unidade" ? "unidades" : matrix.row_type === "predio" ? "prédios" : "regiões"} · {matrix.columns.length} dias
           </span>
           {matrix.rows.length > 0 && (
             <span style={{ marginLeft: "auto", color: "#64748b" }}>
@@ -410,7 +418,7 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
       <thead>
         <tr>
           <th style={{ ...firstColStyle, position: "sticky", top: 0, left: 0, zIndex: 3, color: "#1d4ed8", fontWeight: 600 }}>
-            {matrix.row_type === "unidade" ? "unidade" : "portfólio"}
+            {matrix.row_type === "unidade" ? "unidade" : matrix.row_type === "predio" ? "prédio" : "região"}
           </th>
           {matrix.columns.map((c) => {
             const wknd = isWeekend(c);
@@ -441,7 +449,7 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
           <tr key={row.id}>
             <th style={firstColStyle}>{row.label}</th>
             {row.values.map((v, i) => {
-              const semHeatmap = matrix.table === "pb" || matrix.table === "expectativa_portfolio";
+              const semHeatmap = matrix.table === "pb" || matrix.table === "expectativa_regiao";
               // Se o backend mandou color_values, usamos esses valores (em %)
               // pra colorir; os valores "values" continuam sendo mostrados na célula.
               const cv = row.color_values?.[i] ?? null;
@@ -459,11 +467,11 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                   )
                 : cellColor(v, matrix.min, matrix.max, matrix.format);
               const deltaLabel = COLOR_DELTA_LABEL[matrix.table] ?? "delta";
-              // Em ocupacao_portfolio o próprio valor da célula já mostra a real,
+              // Em ocupacao_regiao o próprio valor da célula já mostra a real,
               // então o tooltip traz apenas o gap. Nas demais (ex: pi) mantém valor + delta.
               const tooltip = v === null
                 ? "sem dado"
-                : useColorDriver && matrix.table === "ocupacao_portfolio"
+                : useColorDriver && matrix.table === "ocupacao_regiao"
                 ? `${formatValue(cv, "percent")} ${deltaLabel}`
                 : useColorDriver
                 ? `${formatValue(v, matrix.format)}  ·  ${formatValue(cv, "percent")} ${deltaLabel}`
@@ -509,7 +517,7 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                 color: "#0f172a",
                 zIndex: 2,
               }}
-              title="Soma diária do impacto (Preço Final − Preço Base) em todas as unidades do portfólio"
+              title="Soma diária do impacto (Preço Final − Preço Base) em todas as unidades"
             >
               Impacto (R$)
             </th>

@@ -25,9 +25,9 @@ Nenhum é bloqueador.
 |---|---|---|
 | `unidades` / `pb` | `listings` + `basePrice` | Baixa — `GET /listings` traz preço base, capacidade, minNights |
 | `reserva_diarias` | `reservations` + webhook `reservation.new`/`reservation.updated` | Baixa — endpoint REST + webhook em tempo real |
-| `ocupacao_portfolio` | derivada de `reservations` | Baixa — agregação continua do lado de cá |
+| `ocupacao_regiao` | derivada de `reservations` | Baixa — agregação continua do lado de cá |
 | `d` (preço final) | `PUT /availability-pricing/api/calendar/listings/{id}` | **Média** — ver §4.1 |
-| `expectativa_portfolio` | (não tem equivalente) | Fica do nosso lado — histórico + modelo |
+| `expectativa_regiao` | (não tem equivalente) | Fica do nosso lado — histórico + modelo |
 | `regras_priori` / `regras_posteriori` | (não tem equivalente) | Lógica interna, não precisa viajar pro Guesty |
 
 A tradução é direta: `listing_id` do Guesty vira `unidade_id`; `basePrice` entra em `pb`; `reservations` alimenta `reserva_diarias`; `d` sai pelo PUT do calendário.

@@ -2,6 +2,8 @@
 
 > Documento base: `regras.pdf` — especificação do motor de precificação dinâmica da Cyclinn.
 > Esta análise identifica o que está bem definido, o que é ambíguo, o que está incompleto, e quais perguntas precisam ser respondidas antes da implementação.
+>
+> **Nota de nomenclatura (abr/2026):** o termo "portfólio" usado no PDF foi renomeado para "região" na implementação. O nome "portfólio" foi reservado pra um agrupamento mais flexível e abstrato no futuro (ex: combinar regiões/segmentos/marcas). Onde o texto abaixo cita "portfólio", leia "região" no contexto do código atual (`ocupacao_regiao`, `expectativa_regiao`, etc.).
 
 ---
 

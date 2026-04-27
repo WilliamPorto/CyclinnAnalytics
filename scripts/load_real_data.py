@@ -526,7 +526,7 @@ def gen_regras_posteriori(cad, calendar_start, calendar_end):
         rid += 1
     write_parquet("regras_posteriori", "regras_ocupacao_individual", pd.DataFrame(ind_rows))
 
-    # --- Ocupação portfolio (por região) ---
+    # --- Ocupação por região ---
     port_spec = [
         (14, None, 0.40, -0.08), (14, 0.60, None, 0.08),
         (7, None, 0.45, -0.10), (7, 0.65, None, 0.10),
@@ -540,9 +540,9 @@ def gen_regras_posteriori(cad, calendar_start, calendar_end):
                               "janela_dias": j, "ocupacao_min_pct": omin, "ocupacao_max_pct": omax,
                               "ajuste_pct": adj, "cumulativo": True})
             rid += 1
-    write_parquet("regras_posteriori", "regras_ocupacao_portfolio", pd.DataFrame(port_rows))
+    write_parquet("regras_posteriori", "regras_ocupacao_regiao", pd.DataFrame(port_rows))
 
-    # --- Expectativa portfolio ---
+    # --- Expectativa por região ---
     exp_rows = []
     exp_id = 1
     for regiao_id in all_regiao_ids:
@@ -560,7 +560,7 @@ def gen_regras_posteriori(cad, calendar_start, calendar_end):
                 exp_id += 1
     exp = pd.DataFrame(exp_rows)
     exp["data"] = pd.to_datetime(exp["data"]).dt.date
-    write_parquet("regras_posteriori", "expectativa_portfolio", exp)
+    write_parquet("regras_posteriori", "expectativa_regiao", exp)
 
     # --- Ocupação externa ---
     oc_ext_rows = []
@@ -649,7 +649,7 @@ def gen_calendario(cad, pb_map, rsv_state, calendar_start, calendar_end):
                     "ev_pct": round(ev, 4),
                     "ant_pct": round(ant, 4),
                     "pi": round(pi, 2),
-                    "ajuste_portfolio_pct": round(ajuste_port, 4),
+                    "ajuste_regiao_pct": round(ajuste_port, 4),
                     "ajuste_individual_pct": round(ajuste_ind, 4),
                     "diaria_final": round(diaria, 2),
                     "diaria_final_clamped": round(clamped, 2),

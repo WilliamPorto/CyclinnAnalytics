@@ -144,7 +144,7 @@ export default function OcupacaoTab() {
     setLoading(true);
     setError(null);
     try {
-      const r = await apiFetch("/api/regras/ocupacao-portfolio");
+      const r = await apiFetch("/api/regras/ocupacao-regiao");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setBuckets(d.buckets ?? []);
@@ -163,8 +163,8 @@ export default function OcupacaoTab() {
     async (janelaOriginal: number | null, shape: Shape) => {
       const isNew = janelaOriginal === null;
       const url = isNew
-        ? "/api/regras/ocupacao-portfolio/bucket"
-        : `/api/regras/ocupacao-portfolio/bucket/${janelaOriginal}`;
+        ? "/api/regras/ocupacao-regiao/bucket"
+        : `/api/regras/ocupacao-regiao/bucket/${janelaOriginal}`;
       const res = await apiFetch(url, {
         method: isNew ? "POST" : "PUT",
         headers: { "Content-Type": "application/json" },
@@ -184,7 +184,7 @@ export default function OcupacaoTab() {
 
   const deletarBucket = async (b: Bucket) => {
     if (!confirm(`Excluir bucket "${labelBucket(b.janela_dias)}"?`)) return;
-    const r = await apiFetch(`/api/regras/ocupacao-portfolio/bucket/${b.janela_dias}`, {
+    const r = await apiFetch(`/api/regras/ocupacao-regiao/bucket/${b.janela_dias}`, {
       method: "DELETE",
     });
     if (r.ok) {
@@ -288,7 +288,7 @@ export default function OcupacaoTab() {
 
           <div style={{ marginTop: 24, fontSize: 11, color: "#64748b", lineHeight: 1.5 }}>
             <strong>Como funciona:</strong> para cada unidade × dia, o motor determina o
-            bucket (pela antecedência), pega a ocupação real do portfólio da região, e
+            bucket (pela antecedência), pega a ocupação real da região, e
             aplica a banda correspondente. Bandas cobrem 0–100% sem buracos; remover um
             limite funde duas bandas mantendo o valor da direita.
           </div>

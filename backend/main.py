@@ -256,12 +256,12 @@ SIMULADOR_TABLES: dict[str, tuple[str, str, str]] = {
     "fat_dia_semana":        ("ajuste_pct",             "percent",  "unidade"),
     "fat_eventos":           ("ajuste_pct",             "percent",  "unidade"),
     "fat_antecedencia":      ("ajuste_pct",             "percent",  "unidade"),
-    "fat_ajuste_portfolio":  ("ajuste_pct",             "percent",  "unidade"),
+    "fat_ajuste_regiao":     ("ajuste_pct",             "percent",  "unidade"),
     "fat_ajuste_individual": ("ajuste_pct",             "percent",  "unidade"),
     "pi":                    ("valor",                  "currency", "unidade"),
     "d":                     ("valor",                  "currency", "unidade"),
-    "ocupacao_portfolio":    ("ocupacao_pct",           "percent",  "portfolio"),
-    "expectativa_portfolio": ("ocupacao_esperada_pct",  "percent",  "portfolio"),
+    "ocupacao_regiao":       ("ocupacao_pct",           "percent",  "regiao"),
+    "expectativa_regiao":    ("ocupacao_esperada_pct",  "percent",  "regiao"),
 }
 
 
@@ -294,16 +294,20 @@ def simulador_matrix(
     data_fim: str,
     page: int = 1,
     page_size: int = 25,
-    view: str = "unidade",  # "unidade" | "portfolio"
+    view: str = "unidade",  # "unidade" | "regiao" | "predio"
 ) -> dict:
     if table not in SIMULADOR_TABLES:
         raise HTTPException(status_code=404, detail=f"Tabela '{table}' não suportada")
-    if view not in ("unidade", "portfolio"):
+    if view not in ("unidade", "regiao", "predio"):
         raise HTTPException(status_code=400, detail=f"view inválido: {view}")
 
     value_col, fmt, native_row_type = SIMULADOR_TABLES[table]
-    # Para tabelas que já são nativamente por portfólio, ignoramos "view".
-    effective_row_type = native_row_type if native_row_type == "portfolio" else view
+    # Tabelas nativamente por região só aparecem em views agregadas (regiao/predio).
+    # Em view=unidade, o frontend já bloqueia a aba — aqui forçamos regiao como fallback.
+    if native_row_type == "regiao" and view == "unidade":
+        effective_row_type = "regiao"
+    else:
+        effective_row_type = view
 
     try:
         d_ref = date.fromisoformat(data_referencia)
@@ -319,7 +323,7 @@ def simulador_matrix(
     page_size = max(1, min(200, int(page_size)))
     offset = (page - 1) * page_size
 
-    # Labels (unidades × codigo_externo) ou (regioes × nome)
+    # Labels (unidades, regioes, ou predios)
     if effective_row_type == "unidade":
         total = CON.execute("SELECT COUNT(*) FROM cadastro.unidades").fetchone()[0]
         label_rows = CON.execute(
@@ -330,7 +334,17 @@ def simulador_matrix(
             LIMIT {page_size} OFFSET {offset}
             """
         ).fetchall()
-    else:
+    elif effective_row_type == "predio":
+        total = CON.execute("SELECT COUNT(*) FROM cadastro.predios").fetchone()[0]
+        label_rows = CON.execute(
+            f"""
+            SELECT predio_id, nome
+            FROM cadastro.predios
+            ORDER BY nome
+            LIMIT {page_size} OFFSET {offset}
+            """
+        ).fetchall()
+    else:  # regiao
         total = CON.execute("SELECT COUNT(*) FROM cadastro.regioes").fetchone()[0]
         label_rows = CON.execute(
             f"""
@@ -354,28 +368,44 @@ def simulador_matrix(
     d_ini_s = d_ini.isoformat()
     d_fim_s = d_fim.isoformat()
 
-    needs_aggregation = effective_row_type == "portfolio" and native_row_type == "unidade"
+    needs_aggregation = native_row_type == "unidade" and effective_row_type != "unidade"
+
+    # Coluna agregadora quando view != unidade pra tabelas unit-level.
+    agg_col = "p.regiao_id" if effective_row_type == "regiao" else "u.predio_id"
 
     # Define se a tabela injeta uma coluna color_pct (usada pra heatmap por
     # diferença em vez de pelo valor absoluto).
-    #   pi                  → color_pct = (pi − pb) / pb    (fatores a priori)
-    #   d                   → color_pct = (d − pb) / pb     (impacto total vs preço base)
-    #   ocupacao_portfolio  → color_pct = real − esperada
-    has_color_pct = table in ("pi", "d", "ocupacao_portfolio")
+    #   pi                → color_pct = (pi − pb) / pb    (fatores a priori)
+    #   d                 → color_pct = (d − pb) / pb     (impacto total vs preço base)
+    #   ocupacao_regiao   → color_pct = real − esperada
+    has_color_pct = table in ("pi", "d", "ocupacao_regiao")
 
     def build_values_sql(ids_filter: str) -> str:
-        # Ocupação real: v = real, color_pct = (real − esperada) → heatmap pelo gap
-        if table == "ocupacao_portfolio":
+        # Ocupação real: v = real, color_pct = (real − esperada) → heatmap pelo gap.
+        # Em view=predio, faz swap pras tabelas ocupacao_predio + expectativa_predio.
+        if table == "ocupacao_regiao":
+            if effective_row_type == "predio":
+                return f"""
+                    SELECT o.predio_id AS id, o.data,
+                           o.ocupacao_pct AS v,
+                           (o.ocupacao_pct - e.ocupacao_esperada_pct) AS color_pct
+                    FROM {SIMULADOR_ALIAS}.main.ocupacao_predio o
+                    JOIN {SIMULADOR_ALIAS}.main.expectativa_predio e
+                      USING(data_referencia, predio_id, data)
+                    WHERE o.data_referencia = DATE '{d_ref_s}'
+                      AND o.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                      {ids_filter.replace('predio_id', 'o.predio_id')}
+                """
             return f"""
-                SELECT o.portfolio_id AS id, o.data,
+                SELECT o.regiao_id AS id, o.data,
                        o.ocupacao_pct AS v,
                        (o.ocupacao_pct - e.ocupacao_esperada_pct) AS color_pct
-                FROM {SIMULADOR_ALIAS}.main.ocupacao_portfolio o
-                JOIN {SIMULADOR_ALIAS}.main.expectativa_portfolio e
-                  USING(data_referencia, portfolio_id, data)
+                FROM {SIMULADOR_ALIAS}.main.ocupacao_regiao o
+                JOIN {SIMULADOR_ALIAS}.main.expectativa_regiao e
+                  USING(data_referencia, regiao_id, data)
                 WHERE o.data_referencia = DATE '{d_ref_s}'
                   AND o.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
-                  {ids_filter.replace('portfolio_id', 'o.portfolio_id')}
+                  {ids_filter.replace('regiao_id', 'o.regiao_id')}
             """
         # pi: retorna também o % de diferença vs Pb (= soma dos fatores a priori)
         if table == "pi":
@@ -391,7 +421,7 @@ def simulador_matrix(
                       {ids_filter.replace('unidade_id', 'pi.unidade_id')}
                 """
             return f"""
-                SELECT p.regiao_id AS id, pi.data,
+                SELECT {agg_col} AS id, pi.data,
                        AVG(pi.valor) AS v,
                        AVG((pi.valor - pb.valor) / pb.valor) AS color_pct
                 FROM {SIMULADOR_ALIAS}.main.pi pi
@@ -402,7 +432,7 @@ def simulador_matrix(
                 WHERE pi.data_referencia = DATE '{d_ref_s}'
                   AND pi.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
                   {ids_filter}
-                GROUP BY p.regiao_id, pi.data
+                GROUP BY {agg_col}, pi.data
             """
         # d: retorna também o % de diferença vs Pb (= impacto total vs preço base)
         if table == "d":
@@ -418,7 +448,7 @@ def simulador_matrix(
                       {ids_filter.replace('unidade_id', 'd.unidade_id')}
                 """
             return f"""
-                SELECT p.regiao_id AS id, d.data,
+                SELECT {agg_col} AS id, d.data,
                        AVG(d.valor) AS v,
                        AVG((d.valor - pb.valor) / pb.valor) AS color_pct
                 FROM {SIMULADOR_ALIAS}.main.d d
@@ -429,10 +459,20 @@ def simulador_matrix(
                 WHERE d.data_referencia = DATE '{d_ref_s}'
                   AND d.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
                   {ids_filter}
-                GROUP BY p.regiao_id, d.data
+                GROUP BY {agg_col}, d.data
+            """
+        # expectativa_regiao em view=predio: lê de expectativa_predio
+        if table == "expectativa_regiao" and effective_row_type == "predio":
+            return f"""
+                SELECT predio_id AS id, data, ocupacao_esperada_pct AS v,
+                       NULL::DOUBLE AS color_pct
+                FROM {SIMULADOR_ALIAS}.main.expectativa_predio
+                WHERE data_referencia = DATE '{d_ref_s}'
+                  AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+                  {ids_filter}
             """
         if not needs_aggregation:
-            key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
+            key_col = "unidade_id" if native_row_type == "unidade" else "regiao_id"
             return f"""
                 SELECT {key_col} AS id, data, {value_col} AS v, NULL::DOUBLE AS color_pct
                 FROM {SIMULADOR_ALIAS}.main.{table}
@@ -440,26 +480,29 @@ def simulador_matrix(
                   AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
                   {ids_filter}
             """
-        # Agrega por região (média simples)
+        # Agrega por região ou prédio (média simples)
         return f"""
-            SELECT p.regiao_id AS id, t.data, AVG(t.{value_col}) AS v, NULL::DOUBLE AS color_pct
+            SELECT {agg_col} AS id, t.data, AVG(t.{value_col}) AS v, NULL::DOUBLE AS color_pct
             FROM {SIMULADOR_ALIAS}.main.{table} t
             JOIN cadastro.unidades u ON u.unidade_id = t.unidade_id
             JOIN cadastro.predios p USING(predio_id)
             WHERE t.data_referencia = DATE '{d_ref_s}'
               AND t.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
               {ids_filter}
-            GROUP BY p.regiao_id, t.data
+            GROUP BY {agg_col}, t.data
         """
 
     matrix_rows: list[dict] = []
     if ids:
         ids_list = ",".join(str(i) for i in ids)
         if needs_aggregation:
-            ids_filter = f"AND p.regiao_id IN ({ids_list})"
-        else:
-            key_col = "unidade_id" if native_row_type == "unidade" else "portfolio_id"
+            ids_filter = f"AND {agg_col} IN ({ids_list})"
+        elif native_row_type == "regiao":
+            # tabelas região-nativas: chave é regiao_id ou predio_id (em view=predio)
+            key_col = "predio_id" if effective_row_type == "predio" else "regiao_id"
             ids_filter = f"AND {key_col} IN ({ids_list})"
+        else:
+            ids_filter = f"AND unidade_id IN ({ids_list})"
         values_rows = CON.execute(build_values_sql(ids_filter)).fetchall()
         lookup: dict[tuple[int, str], Any] = {}
         color_lookup: dict[tuple[int, str], Any] = {}
@@ -485,7 +528,7 @@ def simulador_matrix(
     color_max = float(stats[3]) if has_color_pct and stats[3] is not None else None
 
     # Linha de totais (apenas para a matriz `d`): soma do impacto em R$ por dia
-    # considerando TODAS as unidades do portfolio, independente de paginação/view.
+    # considerando TODAS as unidades, independente de paginação/view.
     day_totals: Optional[list[Optional[float]]] = None
     if table == "d":
         totals_rows = CON.execute(
@@ -1593,15 +1636,15 @@ def deletar_faixa_antecedencia(
     return {"ok": True, "linhas_removidas": removidas}
 
 
-# ─── Ocupação (portfólio) ─────────────────────────────────────
+# ─── Ocupação (região) ─────────────────────────────────────
 
-OCUP_PORTFOLIO_PARQUET = (
-    DATA_ROOT / "regras_posteriori" / "regras_ocupacao_portfolio" / "regras_ocupacao_portfolio.parquet"
+OCUP_REGIAO_PARQUET = (
+    DATA_ROOT / "regras_posteriori" / "regras_ocupacao_regiao" / "regras_ocupacao_regiao.parquet"
 )
 
 
-def _read_ocup_portfolio_df() -> pd.DataFrame:
-    if not OCUP_PORTFOLIO_PARQUET.exists():
+def _read_ocup_regiao_df() -> pd.DataFrame:
+    if not OCUP_REGIAO_PARQUET.exists():
         return pd.DataFrame(
             columns=[
                 "regra_id", "escopo", "escopo_id",
@@ -1609,14 +1652,14 @@ def _read_ocup_portfolio_df() -> pd.DataFrame:
                 "ajuste_pct", "cumulativo",
             ]
         )
-    df = pd.read_parquet(OCUP_PORTFOLIO_PARQUET)
+    df = pd.read_parquet(OCUP_REGIAO_PARQUET)
     if "ativo" in df.columns:
         df = df.drop(columns=["ativo"])
     return df
 
 
-def _write_ocup_portfolio_df(df: pd.DataFrame) -> None:
-    OCUP_PORTFOLIO_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+def _write_ocup_regiao_df(df: pd.DataFrame) -> None:
+    OCUP_REGIAO_PARQUET.parent.mkdir(parents=True, exist_ok=True)
     if not df.empty:
         df = df.copy()
         df["regra_id"] = df["regra_id"].astype("int64")
@@ -1625,7 +1668,7 @@ def _write_ocup_portfolio_df(df: pd.DataFrame) -> None:
         df["ocupacao_min_pct"] = df["ocupacao_min_pct"].astype(float)
         df["ocupacao_max_pct"] = df["ocupacao_max_pct"].astype(float)
         df["ajuste_pct"] = df["ajuste_pct"].astype(float)
-    df.to_parquet(OCUP_PORTFOLIO_PARQUET, index=False)
+    df.to_parquet(OCUP_REGIAO_PARQUET, index=False)
 
 
 def _serializar_buckets_ocup(df: pd.DataFrame) -> list[dict]:
@@ -1650,9 +1693,9 @@ def _serializar_buckets_ocup(df: pd.DataFrame) -> list[dict]:
     return buckets
 
 
-@app.get("/regras/ocupacao-portfolio")
-def listar_ocupacao_portfolio() -> dict:
-    df = _read_ocup_portfolio_df()
+@app.get("/regras/ocupacao-regiao")
+def listar_ocupacao_regiao() -> dict:
+    df = _read_ocup_regiao_df()
     if df.empty:
         return {"buckets": []}
     return {"buckets": _serializar_buckets_ocup(df)}
@@ -1704,34 +1747,34 @@ def _bucket_para_linhas(body: BucketOcupIn, start_id: int) -> list[dict]:
     return linhas
 
 
-@app.post("/regras/ocupacao-portfolio/bucket", status_code=201)
+@app.post("/regras/ocupacao-regiao/bucket", status_code=201)
 def criar_bucket_ocup(
     body: BucketOcupIn,
     x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
 ) -> dict:
     _validar_bucket_ocup(body)
-    df = _read_ocup_portfolio_df()
+    df = _read_ocup_regiao_df()
     if (df["janela_dias"] == body.janela_dias).any():
         raise HTTPException(status_code=409, detail=f"Bucket {body.janela_dias} já existe")
     next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
     linhas = _bucket_para_linhas(body, next_id)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
-    _write_ocup_portfolio_df(df)
+    _write_ocup_regiao_df(df)
     log_operacao(
         _get_usuario(x_usuario), "create",
-        "regras.ocupacao_portfolio", str(body.janela_dias),
+        "regras.ocupacao_regiao", str(body.janela_dias),
         {"limites": body.limites, "ajustes": body.ajustes},
     )
     return {"ok": True}
 
 
-@app.put("/regras/ocupacao-portfolio/bucket/{janela_dias}")
+@app.put("/regras/ocupacao-regiao/bucket/{janela_dias}")
 def atualizar_bucket_ocup(
     janela_dias: int, body: BucketOcupIn,
     x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
 ) -> dict:
     _validar_bucket_ocup(body)
-    df = _read_ocup_portfolio_df()
+    df = _read_ocup_regiao_df()
 
     if body.janela_dias != janela_dias:
         if not (df["janela_dias"] == janela_dias).any():
@@ -1748,30 +1791,30 @@ def atualizar_bucket_ocup(
     next_id = int(df["regra_id"].max()) + 1 if not df.empty else 1
     linhas = _bucket_para_linhas(body, next_id)
     df = pd.concat([df, pd.DataFrame(linhas)], ignore_index=True)
-    _write_ocup_portfolio_df(df)
+    _write_ocup_regiao_df(df)
     log_operacao(
         _get_usuario(x_usuario), "update",
-        "regras.ocupacao_portfolio", str(janela_dias),
+        "regras.ocupacao_regiao", str(janela_dias),
         {"nova_janela": body.janela_dias, "limites": body.limites, "ajustes": body.ajustes},
     )
     return {"ok": True}
 
 
-@app.delete("/regras/ocupacao-portfolio/bucket/{janela_dias}")
+@app.delete("/regras/ocupacao-regiao/bucket/{janela_dias}")
 def deletar_bucket_ocup(
     janela_dias: int,
     x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
 ) -> dict:
-    df = _read_ocup_portfolio_df()
+    df = _read_ocup_regiao_df()
     mask = df["janela_dias"] == janela_dias
     if not mask.any():
         raise HTTPException(status_code=404, detail="Bucket não encontrado")
     removidas = int(mask.sum())
     df = df[~mask].copy()
-    _write_ocup_portfolio_df(df)
+    _write_ocup_regiao_df(df)
     log_operacao(
         _get_usuario(x_usuario), "delete",
-        "regras.ocupacao_portfolio", str(janela_dias),
+        "regras.ocupacao_regiao", str(janela_dias),
         {"linhas_removidas": removidas},
     )
     return {"ok": True, "linhas_removidas": removidas}

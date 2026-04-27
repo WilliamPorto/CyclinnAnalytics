@@ -559,7 +559,7 @@ function Drawer({
           }}
           style={inp}
         >
-          <option value="global">Global (todo o portfólio)</option>
+          <option value="global">Global (todas as regiões)</option>
           <option value="regiao">Região</option>
           <option value="predio">Prédio</option>
           <option value="segmento">Segmento</option>

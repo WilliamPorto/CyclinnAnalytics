@@ -29,7 +29,7 @@ Os 8 domínios do modelo (ver `docs/analise_regras.md` e o schema de dados):
 | `cadastro` | brands, regioes, predios, segmentos, faixas_precificacao, canais, unidades |
 | `preco_base` | precos_base |
 | `regras_priori` | regras_sazonalidade, regras_dia_semana, eventos, evento_impactos, regras_antecedencia |
-| `regras_posteriori` | regras_ocupacao_individual, regras_ocupacao_portfolio, expectativa_portfolio, ocupacao_externa |
+| `regras_posteriori` | regras_ocupacao_individual, regras_ocupacao_regiao, expectativa_regiao, ocupacao_externa |
 | `reservas` | reservas, reserva_diarias |
 | `calendario` | calendario_unidade, calendario_unidade_historico |
 | `guardrails` | guardrails_unidade, overrides_preco |

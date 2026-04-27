@@ -1,7 +1,7 @@
 """
-Sobrescreve `ocupacao_portfolio` no simulador.duckdb com dados sintéticos
-calibrados pra ficar próximos da `expectativa_portfolio`, e REPROCESSA em
-cascata `fat_ajuste_portfolio` e `d` — útil pra testar a UI do heatmap
+Sobrescreve `ocupacao_regiao` no simulador.duckdb com dados sintéticos
+calibrados pra ficar próximos da `expectativa_regiao`, e REPROCESSA em
+cascata `fat_ajuste_regiao` e `d` — útil pra testar a UI do heatmap
 sem que tudo fique no vermelho.
 
 Distribuição da ocupação fake:
@@ -51,49 +51,63 @@ def main() -> None:
         )
 
     con = duckdb.connect(str(DB_PATH))
-    exp = con.execute(
-        """
-        SELECT data_referencia, portfolio_id, data, ocupacao_esperada_pct
-        FROM expectativa_portfolio
-        """
-    ).df()
-
-    if exp.empty:
-        raise SystemExit("expectativa_portfolio vazia.")
-
     rng = np.random.default_rng(SEED)
-    n = len(exp)
 
-    # Pequeno gap: N(0, SMALL_STD), clipado em ±SMALL_CLIP
-    gap_small = np.clip(rng.normal(0, SMALL_STD, n), -SMALL_CLIP, SMALL_CLIP)
+    def synth(esperada: np.ndarray) -> np.ndarray:
+        """Gera ocupação real sintética perto da esperada (gaps pequenos + outliers)."""
+        m = len(esperada)
+        gap_small = np.clip(rng.normal(0, SMALL_STD, m), -SMALL_CLIP, SMALL_CLIP)
+        outlier_mask = rng.random(m) < SHARE_OUTLIERS
+        outlier_sign = rng.choice([-1, 1], m)
+        outlier_mag = rng.uniform(BIG_MIN, BIG_MAX, m)
+        gap_big = outlier_sign * outlier_mag
+        gap = np.where(outlier_mask, gap_big, gap_small)
+        return np.clip(esperada + gap, 0.0, 1.0), gap
 
-    # Outliers: sinal aleatório * magnitude uniforme
-    outlier_mask = rng.random(n) < SHARE_OUTLIERS
-    outlier_sign = rng.choice([-1, 1], n)
-    outlier_mag = rng.uniform(BIG_MIN, BIG_MAX, n)
-    gap_big = outlier_sign * outlier_mag
+    # ── ocupacao_regiao ───────────────────────────────────────────
+    exp = con.execute("""
+        SELECT data_referencia, regiao_id, data, ocupacao_esperada_pct
+        FROM expectativa_regiao
+    """).df()
+    if exp.empty:
+        raise SystemExit("expectativa_regiao vazia.")
 
-    gap = np.where(outlier_mask, gap_big, gap_small)
-    real = np.clip(exp["ocupacao_esperada_pct"].values + gap, 0.0, 1.0)
-
-    # Monta dataframe final com o MESMO schema de ocupacao_portfolio
+    real, gap = synth(exp["ocupacao_esperada_pct"].values)
     df_real = pd.DataFrame({
         "data_referencia": exp["data_referencia"],
-        "portfolio_id": exp["portfolio_id"],
+        "regiao_id": exp["regiao_id"],
         "data": exp["data"],
         "ocupacao_pct": np.round(real, 4),
     })
-
     con.register("df_real", df_real)
-    con.execute("DELETE FROM ocupacao_portfolio")
-    con.execute(
-        """
-        INSERT INTO ocupacao_portfolio
-        SELECT data_referencia, portfolio_id, data, ocupacao_pct FROM df_real
-        """
-    )
+    con.execute("DELETE FROM ocupacao_regiao")
+    con.execute("""
+        INSERT INTO ocupacao_regiao
+        SELECT data_referencia, regiao_id, data, ocupacao_pct FROM df_real
+    """)
 
-    # ────────── Cascata: recompõe fat_ajuste_portfolio e d ──────────
+    # ── ocupacao_predio (por prédio, mesmo modelo de ruído) ───────
+    exp_p = con.execute("""
+        SELECT data_referencia, predio_id, data, ocupacao_esperada_pct
+        FROM expectativa_predio
+    """).df()
+    if not exp_p.empty:
+        real_p, _ = synth(exp_p["ocupacao_esperada_pct"].values)
+        df_real_p = pd.DataFrame({
+            "data_referencia": exp_p["data_referencia"],
+            "predio_id": exp_p["predio_id"],
+            "data": exp_p["data"],
+            "ocupacao_pct": np.round(real_p, 4),
+        })
+        con.register("df_real_p", df_real_p)
+        con.execute("DELETE FROM ocupacao_predio")
+        con.execute("""
+            INSERT INTO ocupacao_predio
+            SELECT data_referencia, predio_id, data, ocupacao_pct FROM df_real_p
+        """)
+    n = len(exp)
+
+    # ────────── Cascata: recompõe fat_ajuste_regiao e d ──────────
     # unit_info é temp table criada em build_simulator_db; recriamos aqui
     # pra reprocessar sem depender daquele script estar "rodando".
     con.execute(f"""
@@ -108,10 +122,10 @@ def main() -> None:
         FROM range(0, 366) t(n)
     """)
     con.execute(f"""
-        CREATE OR REPLACE TABLE fat_ajuste_portfolio AS
+        CREATE OR REPLACE TABLE fat_ajuste_regiao AS
         WITH regras AS (
           SELECT janela_dias, ocupacao_min_pct, ocupacao_max_pct, ajuste_pct
-          FROM read_parquet({pq('regras_posteriori/regras_ocupacao_portfolio/regras_ocupacao_portfolio.parquet')})
+          FROM read_parquet({pq('regras_posteriori/regras_ocupacao_regiao/regras_ocupacao_regiao.parquet')})
         ),
         janelas AS (SELECT DISTINCT janela_dias FROM regras),
         janela_max AS (SELECT MAX(janela_dias) AS max_j FROM janelas),
@@ -128,8 +142,8 @@ def main() -> None:
           SELECT ui.unidade_id, cb.data, r.ajuste_pct
           FROM unit_info ui
           CROSS JOIN cal_bucket cb
-          LEFT JOIN ocupacao_portfolio o
-            ON o.portfolio_id = ui.regiao_id AND o.data = cb.data
+          LEFT JOIN ocupacao_regiao o
+            ON o.regiao_id = ui.regiao_id AND o.data = cb.data
           LEFT JOIN regras r
             ON r.janela_dias = cb.bucket
             AND o.ocupacao_pct >= r.ocupacao_min_pct
@@ -155,20 +169,20 @@ def main() -> None:
             ), 2
           ) AS valor
         FROM pi p
-        LEFT JOIN fat_ajuste_portfolio  fp USING(data_referencia, unidade_id, data)
+        LEFT JOIN fat_ajuste_regiao     fp USING(data_referencia, unidade_id, data)
         LEFT JOIN fat_ajuste_individual fi USING(data_referencia, unidade_id, data)
     """)
     con.close()
 
     # Sumário
     abs_gap = np.abs(gap)
-    n_small = int(abs_gap.__le__(SMALL_CLIP).sum())
-    n_big = int(outlier_mask.sum())
-    print(f"atualizadas {n} linhas em ocupacao_portfolio (+ cascade fat_ajuste_portfolio, d)")
+    n_big = int((abs_gap > SMALL_CLIP).sum())
+    n_small = n - n_big
+    print(f"atualizadas {n} linhas em ocupacao_regiao + ocupacao_predio (+ cascade fat_ajuste_regiao, d)")
     print(f"  pequenos gaps (±{SMALL_CLIP*100:.0f}%):  {n_small:>5} ({n_small/n:.1%})")
     print(f"  outliers (±{BIG_MIN*100:.0f}–{BIG_MAX*100:.0f}%): {n_big:>5} ({n_big/n:.1%})")
-    print(f"\n  ocupação real: min={real.min():.1%}  média={real.mean():.1%}  max={real.max():.1%}")
-    print(f"  gap absoluto : média={abs_gap.mean():.2%}  p95={np.percentile(abs_gap,95):.2%}  max={abs_gap.max():.2%}")
+    print(f"\n  ocupação real (reg.): min={real.min():.1%}  média={real.mean():.1%}  max={real.max():.1%}")
+    print(f"  gap absoluto         : média={abs_gap.mean():.2%}  p95={np.percentile(abs_gap,95):.2%}  max={abs_gap.max():.2%}")
     print(f"\nOK. Pra reverter pra dados reais: rode build_simulator_db.py")
 
 

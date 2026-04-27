@@ -6,10 +6,11 @@ CSVs reais em /tmp/).
 Cada tabela "por unidade" tem schema:
     (data_referencia DATE, unidade_id BIGINT, data DATE, <valor|ajuste_pct>)
 
-Cada tabela "por portfólio" tem schema:
-    (data_referencia DATE, portfolio_id BIGINT, data DATE, <pct>)
+Cada tabela "por região" tem schema:
+    (data_referencia DATE, regiao_id BIGINT, data DATE, <pct>)
 
-Portfólio aqui = região (agrupamento de regiões conforme decidido).
+(O termo "portfólio" foi reservado pra um agrupamento mais flexível futuro
+que pode combinar regiões/segmentos/marcas — ainda não existe no modelo.)
 
 Execução (da raiz do projeto ou de qualquer lugar):
     .venv/bin/python simulador/backend/build_simulator_db.py
@@ -252,13 +253,13 @@ def main() -> None:
     """)
     print(f"fat_antecedencia      {count(con, 'fat_antecedencia'):>8} linhas")
 
-    # ────────────────── 6) ocupacao_portfolio (real) ──────────────────
+    # ────────────────── 6) ocupacao_regiao (real) ──────────────────
     # Por região = (unidades com reserva_diaria) / (total de unidades da região).
-    # Criada aqui (antes de fat_ajuste_portfolio) pra servir de fonte única da
+    # Criada aqui (antes de fat_ajuste_regiao) pra servir de fonte única da
     # ocupação real — assim o fake_ocupacao_teste consegue trocar a ocupação
-    # e recompor só fat_ajuste_portfolio + d.
+    # e recompor só fat_ajuste_regiao + d.
     con.execute(f"""
-        CREATE OR REPLACE TABLE ocupacao_portfolio AS
+        CREATE OR REPLACE TABLE ocupacao_regiao AS
         WITH total AS (
           SELECT regiao_id, COUNT(*) AS total
           FROM unit_info GROUP BY regiao_id
@@ -271,24 +272,51 @@ def main() -> None:
         )
         SELECT
           DATE '{TODAY}' AS data_referencia,
-          t.regiao_id AS portfolio_id,
+          t.regiao_id,
           c.data,
           ROUND(COALESCE(o.ocupadas::DOUBLE / t.total, 0.0), 4) AS ocupacao_pct
         FROM total t
         CROSS JOIN cal c
         LEFT JOIN ocupadas o ON o.regiao_id = t.regiao_id AND o.data = c.data
     """)
-    print(f"ocupacao_portfolio    {count(con, 'ocupacao_portfolio'):>8} linhas")
+    print(f"ocupacao_regiao       {count(con, 'ocupacao_regiao'):>8} linhas")
 
-    # ────────────────── 7) fat_ajuste_portfolio ──────────────────
-    # Para cada (unidade, data): determina o bucket pela antecedência,
-    # pega a ocupação real do portfólio (região) da tabela ocupacao_portfolio
-    # e aplica a banda. Regras globais, gap-free (bandas cobrem 0-100%).
+    # ────────────────── 6b) ocupacao_predio (real) ──────────────────
+    # Mesma lógica de ocupacao_regiao, mas agregada por prédio
+    # (unidades_com_reserva_no_dia / total_de_unidades_do_predio).
+    # Usada apenas no display "por prédio" — não alimenta fat_ajuste_*.
     con.execute(f"""
-        CREATE OR REPLACE TABLE fat_ajuste_portfolio AS
+        CREATE OR REPLACE TABLE ocupacao_predio AS
+        WITH total AS (
+          SELECT predio_id, COUNT(*) AS total
+          FROM unit_info GROUP BY predio_id
+        ),
+        ocupadas AS (
+          SELECT ui.predio_id, rd.data, COUNT(DISTINCT rd.unidade_id) AS ocupadas
+          FROM read_parquet({pq('reservas/reserva_diarias/reserva_diarias.parquet')}) rd
+          JOIN unit_info ui USING(unidade_id)
+          GROUP BY ui.predio_id, rd.data
+        )
+        SELECT
+          DATE '{TODAY}' AS data_referencia,
+          t.predio_id,
+          c.data,
+          ROUND(COALESCE(o.ocupadas::DOUBLE / t.total, 0.0), 4) AS ocupacao_pct
+        FROM total t
+        CROSS JOIN cal c
+        LEFT JOIN ocupadas o ON o.predio_id = t.predio_id AND o.data = c.data
+    """)
+    print(f"ocupacao_predio       {count(con, 'ocupacao_predio'):>8} linhas")
+
+    # ────────────────── 7) fat_ajuste_regiao ──────────────────
+    # Para cada (unidade, data): determina o bucket pela antecedência,
+    # pega a ocupação real da região (tabela ocupacao_regiao) e aplica
+    # a banda. Regras globais, gap-free (bandas cobrem 0-100%).
+    con.execute(f"""
+        CREATE OR REPLACE TABLE fat_ajuste_regiao AS
         WITH regras AS (
           SELECT janela_dias, ocupacao_min_pct, ocupacao_max_pct, ajuste_pct
-          FROM read_parquet({pq('regras_posteriori/regras_ocupacao_portfolio/regras_ocupacao_portfolio.parquet')})
+          FROM read_parquet({pq('regras_posteriori/regras_ocupacao_regiao/regras_ocupacao_regiao.parquet')})
         ),
         janelas AS (SELECT DISTINCT janela_dias FROM regras),
         janela_max AS (SELECT MAX(janela_dias) AS max_j FROM janelas),
@@ -305,8 +333,8 @@ def main() -> None:
           SELECT ui.unidade_id, cb.data, r.ajuste_pct
           FROM unit_info ui
           CROSS JOIN cal_bucket cb
-          LEFT JOIN ocupacao_portfolio o
-            ON o.portfolio_id = ui.regiao_id AND o.data = cb.data
+          LEFT JOIN ocupacao_regiao o
+            ON o.regiao_id = ui.regiao_id AND o.data = cb.data
           LEFT JOIN regras r
             ON r.janela_dias = cb.bucket
             AND o.ocupacao_pct >= r.ocupacao_min_pct
@@ -319,7 +347,7 @@ def main() -> None:
           COALESCE(ajuste_pct, 0.0)::DOUBLE AS ajuste_pct
         FROM aplicada
     """)
-    print(f"fat_ajuste_portfolio  {count(con, 'fat_ajuste_portfolio'):>8} linhas")
+    print(f"fat_ajuste_regiao     {count(con, 'fat_ajuste_regiao'):>8} linhas")
 
     # ────────────────── 7) fat_ajuste_individual (placeholder: 0) ──────────────────
     # TODO: computar comparando ocupação futura da unidade com expectativa.
@@ -374,31 +402,66 @@ def main() -> None:
             ), 2
           ) AS valor
         FROM pi p
-        LEFT JOIN fat_ajuste_portfolio  fp USING(data_referencia, unidade_id, data)
+        LEFT JOIN fat_ajuste_regiao     fp USING(data_referencia, unidade_id, data)
         LEFT JOIN fat_ajuste_individual fi USING(data_referencia, unidade_id, data)
     """)
     print(f"d                     {count(con, 'd'):>8} linhas")
 
-    # ────────────────── 11) expectativa_portfolio ──────────────────
+    # ────────────────── 11) expectativa_regiao ──────────────────
     # Agrega por região (média simples entre segmentos). Dias sem dado → 0.65 default.
     con.execute(f"""
-        CREATE OR REPLACE TABLE expectativa_portfolio AS
+        CREATE OR REPLACE TABLE expectativa_regiao AS
         WITH regioes AS (SELECT DISTINCT regiao_id FROM unit_info),
              exp_agg AS (
                SELECT regiao_id, data, AVG(ocupacao_esperada_pct) AS pct
-               FROM read_parquet({pq('regras_posteriori/expectativa_portfolio/expectativa_portfolio.parquet')})
+               FROM read_parquet({pq('regras_posteriori/expectativa_regiao/expectativa_regiao.parquet')})
                GROUP BY regiao_id, data
              )
         SELECT
           DATE '{TODAY}' AS data_referencia,
-          r.regiao_id AS portfolio_id,
+          r.regiao_id,
           c.data,
           ROUND(COALESCE(e.pct, 0.65), 4) AS ocupacao_esperada_pct
         FROM regioes r
         CROSS JOIN cal c
         LEFT JOIN exp_agg e ON e.regiao_id = r.regiao_id AND e.data = c.data
     """)
-    print(f"expectativa_portfolio {count(con, 'expectativa_portfolio'):>8} linhas")
+    print(f"expectativa_regiao    {count(con, 'expectativa_regiao'):>8} linhas")
+
+    # ────────────── 11b) expectativa_predio ──────────────
+    # Por prédio: média da expectativa entre os (regiao, segmento) presentes
+    # no prédio (ponderada pelo nº de unidades por segmento). Sem dado → 0.65.
+    con.execute(f"""
+        CREATE OR REPLACE TABLE expectativa_predio AS
+        WITH predio_seg AS (
+          SELECT predio_id, regiao_id, segmento_id, COUNT(*) AS n
+          FROM unit_info
+          GROUP BY predio_id, regiao_id, segmento_id
+        ),
+        exp_seg AS (
+          SELECT regiao_id, segmento_id, data, ocupacao_esperada_pct
+          FROM read_parquet({pq('regras_posteriori/expectativa_regiao/expectativa_regiao.parquet')})
+        )
+        SELECT
+          DATE '{TODAY}' AS data_referencia,
+          ps.predio_id,
+          c.data,
+          ROUND(
+            COALESCE(
+              SUM(es.ocupacao_esperada_pct * ps.n) / NULLIF(SUM(ps.n), 0),
+              0.65
+            ),
+            4
+          ) AS ocupacao_esperada_pct
+        FROM predio_seg ps
+        CROSS JOIN cal c
+        LEFT JOIN exp_seg es
+          ON es.regiao_id = ps.regiao_id
+          AND es.segmento_id = ps.segmento_id
+          AND es.data = c.data
+        GROUP BY ps.predio_id, c.data
+    """)
+    print(f"expectativa_predio    {count(con, 'expectativa_predio'):>8} linhas")
 
     # ────────────────── 12) simulador_meta ──────────────────
     con.execute("""
@@ -410,7 +473,7 @@ def main() -> None:
         )
     """)
     obs = (
-        "Base inicial (MVP do simulador). fat_ajuste_portfolio e fat_ajuste_individual "
+        "Base inicial (MVP do simulador). fat_ajuste_regiao e fat_ajuste_individual "
         "preenchidos com 0 — a serem implementados em iterações futuras com a lógica "
         "de bucket/banda (AMB-02). Expectativa fora do horizonte dos dados reais usa "
         "fallback de 0.65."
@@ -428,8 +491,8 @@ def main() -> None:
           (SELECT ROUND(AVG(valor), 2)        FROM pb WHERE data = DATE '{TODAY}') AS pb_medio_d0,
           (SELECT ROUND(AVG(valor), 2)        FROM pi WHERE data = DATE '{TODAY}') AS pi_medio_d0,
           (SELECT ROUND(AVG(valor), 2)        FROM d  WHERE data = DATE '{TODAY}') AS d_medio_d0,
-          (SELECT ROUND(AVG(ocupacao_pct)*100, 1)           FROM ocupacao_portfolio    WHERE data = DATE '{TODAY}') AS ocup_real_pct,
-          (SELECT ROUND(AVG(ocupacao_esperada_pct)*100, 1)  FROM expectativa_portfolio WHERE data = DATE '{TODAY}') AS ocup_esperada_pct
+          (SELECT ROUND(AVG(ocupacao_pct)*100, 1)           FROM ocupacao_regiao    WHERE data = DATE '{TODAY}') AS ocup_real_pct,
+          (SELECT ROUND(AVG(ocupacao_esperada_pct)*100, 1)  FROM expectativa_regiao WHERE data = DATE '{TODAY}') AS ocup_esperada_pct
     """).df()
     print(df.to_string(index=False))
 

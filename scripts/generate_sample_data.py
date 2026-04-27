@@ -7,7 +7,7 @@ Os 8 schemas:
   cadastro          — brands, regioes, predios, segmentos, faixas, canais, unidades
   preco_base        — precos_base (versionado)
   regras_priori     — sazonalidade, dia_semana, eventos, evento_impactos, antecedencia
-  regras_posteriori — ocupacao_individual, ocupacao_portfolio, expectativa, ocupacao_externa
+  regras_posteriori — ocupacao_individual, ocupacao_regiao, expectativa, ocupacao_externa
   reservas          — reservas, reserva_diarias
   calendario        — calendario_unidade, calendario_unidade_historico
   guardrails        — guardrails_unidade, overrides_preco
@@ -407,7 +407,7 @@ def gen_regras_posteriori(cad: dict) -> dict:
     ind_df = pd.DataFrame(ind_rows)
     write_parquet("regras_posteriori", "regras_ocupacao_individual", ind_df)
 
-    # --- Ocupacao portfolio (AMB-05 — não definido no PDF, amostra plausível) ---
+    # --- Ocupacao por região (AMB-05 — não definido no PDF, amostra plausível) ---
     port_spec = [
         (14, None, 0.40, -0.08),
         (14, 0.60, None, 0.08),
@@ -434,9 +434,9 @@ def gen_regras_posteriori(cad: dict) -> dict:
             )
             regra_id += 1
     port_df = pd.DataFrame(port_rows)
-    write_parquet("regras_posteriori", "regras_ocupacao_portfolio", port_df)
+    write_parquet("regras_posteriori", "regras_ocupacao_regiao", port_df)
 
-    # --- Expectativa portfolio (uma linha por regiao x segmento x dia) ---
+    # --- Expectativa por região (uma linha por regiao x segmento x dia) ---
     exp_rows = []
     exp_id = 1
     for regiao_id in [1, 2, 3, 4, 5]:
@@ -464,7 +464,7 @@ def gen_regras_posteriori(cad: dict) -> dict:
                 exp_id += 1
     exp_df = pd.DataFrame(exp_rows)
     exp_df["data"] = pd.to_datetime(exp_df["data"]).dt.date
-    write_parquet("regras_posteriori", "expectativa_portfolio", exp_df)
+    write_parquet("regras_posteriori", "expectativa_regiao", exp_df)
 
     # --- Ocupacao externa (benchmark de mercado) ---
     oc_ext_rows = []
@@ -679,7 +679,7 @@ def gen_calendario(cad: dict, pb_map: dict, reservas_state: dict) -> dict:
                     "ev_pct": round(ev, 4),
                     "ant_pct": round(ant, 4),
                     "pi": round(pi, 2),
-                    "ajuste_portfolio_pct": round(ajuste_port, 4),
+                    "ajuste_regiao_pct": round(ajuste_port, 4),
                     "ajuste_individual_pct": round(ajuste_ind, 4),
                     "diaria_final": round(diaria, 2),
                     "diaria_final_clamped": round(diaria_clamped, 2),

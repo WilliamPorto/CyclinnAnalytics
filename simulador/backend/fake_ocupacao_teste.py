@@ -1,14 +1,32 @@
 """
-Sobrescreve `ocupacao_regiao` no simulador.duckdb com dados sintéticos
-calibrados pra ficar próximos da `expectativa_regiao`, e REPROCESSA em
-cascata `fat_ajuste_regiao` e `d` — útil pra testar a UI do heatmap
-sem que tudo fique no vermelho.
+Sobrescreve as 4 tabelas de ocupação no simulador.duckdb com dados sintéticos
+calibrados pra exercitar a UI:
 
-Distribuição da ocupação fake:
-  • 85% das células → gap N(0, 3%), clipado em ±10%      (pequenos)
-  • 15% das células → gap uniforme ±15% a ±40%            (outliers)
+  • expectativa_regiao  (ocupação esperada por região)
+  • ocupacao_regiao     (ocupação real por região)
+  • expectativa_predio  (ocupação esperada por prédio)
+  • ocupacao_predio     (ocupação real por prédio)
 
-Depois, `ocupacao_pct = esperada + gap` clipado em [0, 1].
+Modelo (mesmo pras 4 tabelas):
+
+  1) Curva no tempo:
+        pct(lead) = BASELINE + (PEAK - BASELINE) * exp(-lead / TAU_DAYS)
+     • lead = 0      → ~PEAK (alta perto da data de referência)
+     • lead = TAU    → ~56% do caminho até BASELINE
+     • lead grande   → ~BASELINE (ocupação cai bastante)
+
+  2) Variação por entidade (offset constante no tempo): ±REGIAO_JITTER /
+     ±PREDIO_JITTER pra diferenciar regiões e prédios entre si.
+
+  3) Ruído diário gaussiano (DAILY_NOISE) pra evitar curva perfeita.
+
+  4) Real ≈ esperada na maioria (gap N(0, SMALL_GAP_STD) clipado em
+     ±SMALL_GAP_CLIP). ~SHARE_OUTLIERS das células recebem um gap deliberado
+     (±OUTLIER_MIN a OUTLIER_MAX) pra dar visibilidade ao heatmap de
+     diferença real − esperada.
+
+Em seguida, REPROCESSA em cascata `fat_ajuste_regiao` e `d` (preço final),
+já que a ocupação por região alimenta a regra a posteriori.
 
 Execução:
   .venv/bin/python simulador/backend/fake_ocupacao_teste.py
@@ -34,14 +52,33 @@ DB_PATH = SCRIPT_DIR / "simulador.duckdb"
 TODAY = date(2026, 4, 23)  # mantém em sincronia com build_simulator_db.py
 
 SEED = 42
-SHARE_OUTLIERS = 0.15
-SMALL_STD = 0.03
-SMALL_CLIP = 0.10
-BIG_MIN, BIG_MAX = 0.15, 0.40
+
+# Curva no tempo
+PEAK = 0.90       # ocupação esperada perto da data de referência
+BASELINE = 0.35   # ocupação esperada no horizonte distante
+TAU_DAYS = 30.0   # constante de decaimento (em dias)
+
+# Variação entre entidades (mesmo entity_id mantém o mesmo offset em todo período)
+REGIAO_JITTER = 0.03
+PREDIO_JITTER = 0.04
+
+# Ruído gaussiano diário (aplicado a expectativa)
+DAILY_NOISE = 0.02
+
+# Gap esperada → real (na maioria pequeno; alguns outliers visíveis)
+SMALL_GAP_STD = 0.02
+SMALL_GAP_CLIP = 0.05
+SHARE_OUTLIERS = 0.06
+OUTLIER_MIN, OUTLIER_MAX = 0.15, 0.25
 
 
 def pq(rel: str) -> str:
     return f"'{(DATA_ROOT / rel).as_posix()}'"
+
+
+def lead_curve(lead_days: np.ndarray) -> np.ndarray:
+    """Ocupação esperada em função do lead time (decaimento exponencial)."""
+    return BASELINE + (PEAK - BASELINE) * np.exp(-lead_days / TAU_DAYS)
 
 
 def main() -> None:
@@ -53,59 +90,111 @@ def main() -> None:
     con = duckdb.connect(str(DB_PATH))
     rng = np.random.default_rng(SEED)
 
-    def synth(esperada: np.ndarray) -> np.ndarray:
-        """Gera ocupação real sintética perto da esperada (gaps pequenos + outliers)."""
-        m = len(esperada)
-        gap_small = np.clip(rng.normal(0, SMALL_STD, m), -SMALL_CLIP, SMALL_CLIP)
-        outlier_mask = rng.random(m) < SHARE_OUTLIERS
-        outlier_sign = rng.choice([-1, 1], m)
-        outlier_mag = rng.uniform(BIG_MIN, BIG_MAX, m)
-        gap_big = outlier_sign * outlier_mag
-        gap = np.where(outlier_mask, gap_big, gap_small)
-        return np.clip(esperada + gap, 0.0, 1.0), gap
+    def gen_pair(entity_col: str, jitter: float, source_table: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        """
+        Gera (expectativa_df, real_df) sintéticas pro nível dado.
+        Usa a tabela existente só pra extrair as combinações (entity_id, data).
+        Retorna também um dict com estatísticas pro sumário.
+        """
+        df = con.execute(
+            f"SELECT data_referencia, {entity_col}, data FROM {source_table}"
+        ).df()
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame(), {}
 
-    # ── ocupacao_regiao ───────────────────────────────────────────
-    exp = con.execute("""
+        # Lead em dias (data_referencia → data)
+        lead = (
+            pd.to_datetime(df["data"]) - pd.to_datetime(df["data_referencia"])
+        ).dt.days.values
+
+        # Curva base + offset por entidade (consistente) + ruído diário
+        base = lead_curve(lead)
+        unique_ids = df[entity_col].unique()
+        ent_offset_map = {
+            int(eid): float(rng.uniform(-jitter, jitter)) for eid in unique_ids
+        }
+        ent_offset = df[entity_col].map(ent_offset_map).values.astype(float)
+        daily_noise = rng.normal(0, DAILY_NOISE, len(df))
+        expectativa = np.clip(base + ent_offset + daily_noise, 0.0, 1.0)
+
+        # Real = expectativa + gap. Maioria small; SHARE_OUTLIERS recebem gap grande.
+        small_gap = np.clip(
+            rng.normal(0, SMALL_GAP_STD, len(df)),
+            -SMALL_GAP_CLIP,
+            SMALL_GAP_CLIP,
+        )
+        outlier_mask = rng.random(len(df)) < SHARE_OUTLIERS
+        outlier_sign = rng.choice([-1, 1], len(df))
+        outlier_mag = rng.uniform(OUTLIER_MIN, OUTLIER_MAX, len(df))
+        outlier_gap = outlier_sign * outlier_mag
+        gap = np.where(outlier_mask, outlier_gap, small_gap)
+        real = np.clip(expectativa + gap, 0.0, 1.0)
+
+        df_exp = pd.DataFrame({
+            "data_referencia": df["data_referencia"],
+            entity_col: df[entity_col],
+            "data": df["data"],
+            "ocupacao_esperada_pct": np.round(expectativa, 4),
+        })
+        df_real = pd.DataFrame({
+            "data_referencia": df["data_referencia"],
+            entity_col: df[entity_col],
+            "data": df["data"],
+            "ocupacao_pct": np.round(real, 4),
+        })
+        stats = {
+            "n": len(df),
+            "n_outliers": int(outlier_mask.sum()),
+            "exp_min": float(expectativa.min()),
+            "exp_mean": float(expectativa.mean()),
+            "exp_max": float(expectativa.max()),
+            "real_min": float(real.min()),
+            "real_mean": float(real.mean()),
+            "real_max": float(real.max()),
+        }
+        return df_exp, df_real, stats
+
+    # ── Região ────────────────────────────────────────────────────
+    df_exp_reg, df_real_reg, stats_reg = gen_pair(
+        "regiao_id", REGIAO_JITTER, "expectativa_regiao"
+    )
+    if df_exp_reg.empty:
+        raise SystemExit("expectativa_regiao vazia. Rode build_simulator_db.py.")
+
+    con.register("df_exp_reg", df_exp_reg)
+    con.register("df_real_reg", df_real_reg)
+    con.execute("DELETE FROM expectativa_regiao")
+    con.execute("""
+        INSERT INTO expectativa_regiao
         SELECT data_referencia, regiao_id, data, ocupacao_esperada_pct
-        FROM expectativa_regiao
-    """).df()
-    if exp.empty:
-        raise SystemExit("expectativa_regiao vazia.")
-
-    real, gap = synth(exp["ocupacao_esperada_pct"].values)
-    df_real = pd.DataFrame({
-        "data_referencia": exp["data_referencia"],
-        "regiao_id": exp["regiao_id"],
-        "data": exp["data"],
-        "ocupacao_pct": np.round(real, 4),
-    })
-    con.register("df_real", df_real)
+        FROM df_exp_reg
+    """)
     con.execute("DELETE FROM ocupacao_regiao")
     con.execute("""
         INSERT INTO ocupacao_regiao
-        SELECT data_referencia, regiao_id, data, ocupacao_pct FROM df_real
+        SELECT data_referencia, regiao_id, data, ocupacao_pct
+        FROM df_real_reg
     """)
 
-    # ── ocupacao_predio (por prédio, mesmo modelo de ruído) ───────
-    exp_p = con.execute("""
-        SELECT data_referencia, predio_id, data, ocupacao_esperada_pct
-        FROM expectativa_predio
-    """).df()
-    if not exp_p.empty:
-        real_p, _ = synth(exp_p["ocupacao_esperada_pct"].values)
-        df_real_p = pd.DataFrame({
-            "data_referencia": exp_p["data_referencia"],
-            "predio_id": exp_p["predio_id"],
-            "data": exp_p["data"],
-            "ocupacao_pct": np.round(real_p, 4),
-        })
-        con.register("df_real_p", df_real_p)
+    # ── Prédio ────────────────────────────────────────────────────
+    df_exp_pred, df_real_pred, stats_pred = gen_pair(
+        "predio_id", PREDIO_JITTER, "expectativa_predio"
+    )
+    if not df_exp_pred.empty:
+        con.register("df_exp_pred", df_exp_pred)
+        con.register("df_real_pred", df_real_pred)
+        con.execute("DELETE FROM expectativa_predio")
+        con.execute("""
+            INSERT INTO expectativa_predio
+            SELECT data_referencia, predio_id, data, ocupacao_esperada_pct
+            FROM df_exp_pred
+        """)
         con.execute("DELETE FROM ocupacao_predio")
         con.execute("""
             INSERT INTO ocupacao_predio
-            SELECT data_referencia, predio_id, data, ocupacao_pct FROM df_real_p
+            SELECT data_referencia, predio_id, data, ocupacao_pct
+            FROM df_real_pred
         """)
-    n = len(exp)
 
     # ────────── Cascata: recompõe fat_ajuste_regiao e d ──────────
     # unit_info é temp table criada em build_simulator_db; recriamos aqui
@@ -174,16 +263,26 @@ def main() -> None:
     """)
     con.close()
 
-    # Sumário
-    abs_gap = np.abs(gap)
-    n_big = int((abs_gap > SMALL_CLIP).sum())
-    n_small = n - n_big
-    print(f"atualizadas {n} linhas em ocupacao_regiao + ocupacao_predio (+ cascade fat_ajuste_regiao, d)")
-    print(f"  pequenos gaps (±{SMALL_CLIP*100:.0f}%):  {n_small:>5} ({n_small/n:.1%})")
-    print(f"  outliers (±{BIG_MIN*100:.0f}–{BIG_MAX*100:.0f}%): {n_big:>5} ({n_big/n:.1%})")
-    print(f"\n  ocupação real (reg.): min={real.min():.1%}  média={real.mean():.1%}  max={real.max():.1%}")
-    print(f"  gap absoluto         : média={abs_gap.mean():.2%}  p95={np.percentile(abs_gap,95):.2%}  max={abs_gap.max():.2%}")
-    print(f"\nOK. Pra reverter pra dados reais: rode build_simulator_db.py")
+    # ── Sumário ───────────────────────────────────────────────────
+    print(
+        "atualizadas tabelas: expectativa_regiao, ocupacao_regiao, "
+        "expectativa_predio, ocupacao_predio (+ cascade fat_ajuste_regiao, d)"
+    )
+    print(f"\ncurva: lead=0 → ~{PEAK:.0%}   |   lead→∞ → ~{BASELINE:.0%}   (tau={TAU_DAYS:.0f} dias)")
+    print(f"outliers (gap visível): {SHARE_OUTLIERS:.0%} das células com ±{OUTLIER_MIN:.0%}–{OUTLIER_MAX:.0%}")
+    if stats_reg:
+        n = stats_reg["n"]
+        out = stats_reg["n_outliers"]
+        print(f"\n[região] {n} linhas, {out} outliers ({out/n:.1%})")
+        print(f"  esperada: min={stats_reg['exp_min']:.1%}  média={stats_reg['exp_mean']:.1%}  max={stats_reg['exp_max']:.1%}")
+        print(f"  real    : min={stats_reg['real_min']:.1%}  média={stats_reg['real_mean']:.1%}  max={stats_reg['real_max']:.1%}")
+    if stats_pred:
+        n = stats_pred["n"]
+        out = stats_pred["n_outliers"]
+        print(f"\n[prédio] {n} linhas, {out} outliers ({out/n:.1%})")
+        print(f"  esperada: min={stats_pred['exp_min']:.1%}  média={stats_pred['exp_mean']:.1%}  max={stats_pred['exp_max']:.1%}")
+        print(f"  real    : min={stats_pred['real_min']:.1%}  média={stats_pred['real_mean']:.1%}  max={stats_pred['real_max']:.1%}")
+    print("\nOK. Pra reverter pra dados reais: rode build_simulator_db.py")
 
 
 if __name__ == "__main__":

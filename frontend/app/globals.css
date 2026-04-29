@@ -1,13 +1,17 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
 * { box-sizing: border-box; }
 
 html, body {
   margin: 0;
   padding: 0;
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
   background: #ffffff;
-  color: #0f172a;
+  color: #1e293b;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
 }
 
 button {
@@ -18,6 +22,15 @@ button {
 button:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+
+/* Remove focus ring no clique do mouse, mantém em navegação por teclado */
+button:focus:not(:focus-visible) {
+  outline: none;
+}
+button:focus-visible {
+  outline: 2px solid #c7d2fe;
+  outline-offset: 1px;
 }
 
 code, pre {

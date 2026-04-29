@@ -175,8 +175,10 @@ export default function SazonalidadeTab() {
           alignItems: "center",
           gap: 12,
           padding: "10px 16px",
-          background: "#f8fafc",
-          borderBottom: "1px solid #e2e8f0",
+          background: "#ffffff",
+          boxShadow: "0 1px 0 rgba(15,23,42,0.06)",
+          position: "relative",
+          zIndex: 4,
         }}
       >
         <button

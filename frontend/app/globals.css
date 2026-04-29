@@ -8,7 +8,7 @@ html, body {
   height: 100%;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
-  background: #ffffff;
+  background: #f8fafc;
   color: #1e293b;
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;

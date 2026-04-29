@@ -502,3 +502,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+    # ───────── Modo demo: gera ocupação fake após build ─────────
+    # Enquanto a integração com a Guesty não estiver pronta, ocupação real
+    # de datas futuras é estruturalmente baixa (booking pace incompleto).
+    # Pra o motor de regras a posteriori reagir e o heatmap comunicar, geramos
+    # uma curva sintética. Remover este bloco quando a Guesty estiver integrada.
+    print("\n── modo demo: gerando ocupação fake ──")
+    import fake_ocupacao_teste
+
+    fake_ocupacao_teste.main()

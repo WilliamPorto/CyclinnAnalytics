@@ -61,7 +61,7 @@ export default function RegrasPage() {
               onMouseEnter={(e) => {
                 if (!active && !disabled) {
                   e.currentTarget.style.color = "#334155";
-                  e.currentTarget.style.background = "#f8fafc";
+                  e.currentTarget.style.background = "#f1f5f9";
                 }
               }}
               onMouseLeave={(e) => {

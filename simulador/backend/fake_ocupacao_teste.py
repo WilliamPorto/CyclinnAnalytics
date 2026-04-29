@@ -282,7 +282,7 @@ def main() -> None:
         print(f"\n[prédio] {n} linhas, {out} outliers ({out/n:.1%})")
         print(f"  esperada: min={stats_pred['exp_min']:.1%}  média={stats_pred['exp_mean']:.1%}  max={stats_pred['exp_max']:.1%}")
         print(f"  real    : min={stats_pred['real_min']:.1%}  média={stats_pred['real_mean']:.1%}  max={stats_pred['real_max']:.1%}")
-    print("\nOK. Pra reverter pra dados reais: rode build_simulator_db.py")
+    print()
 
 
 if __name__ == "__main__":

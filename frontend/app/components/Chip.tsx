@@ -55,7 +55,7 @@ export function Chip({
           transition: "background 80ms, border-color 80ms",
         }}
         onMouseEnter={(e) => {
-          if (!open) e.currentTarget.style.background = "#f8fafc";
+          if (!open) e.currentTarget.style.background = "#f1f5f9";
         }}
         onMouseLeave={(e) => {
           if (!open) e.currentTarget.style.background = "#ffffff";

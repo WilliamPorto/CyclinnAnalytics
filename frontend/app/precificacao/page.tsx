@@ -267,7 +267,7 @@ export default function DashboardsPage() {
                 onMouseEnter={(e) => {
                   if (!active) {
                     e.currentTarget.style.color = "#334155";
-                    e.currentTarget.style.background = "#f8fafc";
+                    e.currentTarget.style.background = "#f1f5f9";
                   }
                 }}
                 onMouseLeave={(e) => {
@@ -341,7 +341,7 @@ export default function DashboardsPage() {
       </div>
 
       {/* Matriz */}
-      <div style={{ flex: 1, overflow: "auto", background: "#ffffff", padding: "8px 0 12px" }}>
+      <div style={{ flex: 1, overflow: "auto", padding: "8px 0 12px" }}>
         {matrix && <MatrixTable matrix={matrix} />}
       </div>
 
@@ -607,7 +607,7 @@ function MoreMenu({
           textAlign: "left",
         }}
         onMouseEnter={(e) => {
-          if (fakeState !== "running") e.currentTarget.style.background = "#f8fafc";
+          if (fakeState !== "running") e.currentTarget.style.background = "#f1f5f9";
         }}
         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >

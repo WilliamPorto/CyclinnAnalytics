@@ -61,7 +61,6 @@ export function NavBar() {
         <Diamond />
         Cyclinn
       </span>
-      {link("/", "SQL Explorer")}
       {link("/precificacao", "Precificação")}
       {link("/regras", "Regras")}
       {link("/auditoria", "Auditoria")}

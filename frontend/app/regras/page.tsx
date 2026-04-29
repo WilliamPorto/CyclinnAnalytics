@@ -23,34 +23,56 @@ export default function RegrasPage() {
       <div
         style={{
           display: "flex",
-          borderBottom: "1px solid #e2e8f0",
+          alignItems: "center",
+          gap: 2,
+          padding: "4px 16px",
+          height: 44,
           background: "#ffffff",
           flex: "0 0 auto",
+          boxShadow: "0 1px 0 rgba(15,23,42,0.06)",
+          position: "relative",
+          zIndex: 5,
         }}
       >
         {SUB_TABS.map((t) => {
           const active = t.key === activeTab;
+          const disabled = !t.enabled;
           return (
             <button
               key={t.key}
               onClick={() => t.enabled && setActiveTab(t.key)}
-              disabled={!t.enabled}
-              title={!t.enabled ? "em breve" : undefined}
+              disabled={disabled}
+              title={disabled ? "em breve" : undefined}
               style={{
-                padding: "10px 16px",
-                background: "transparent",
+                padding: "6px 14px",
+                background: active ? "#eef2ff" : "transparent",
                 border: 0,
-                borderBottom: active ? "2px solid #1d4ed8" : "2px solid transparent",
-                color: !t.enabled ? "#cbd5e1" : active ? "#1d4ed8" : "#475569",
+                borderRadius: 7,
+                color: disabled ? "#cbd5e1" : active ? "#4338ca" : "#64748b",
                 fontWeight: active ? 600 : 500,
                 fontSize: 13,
                 whiteSpace: "nowrap",
                 fontFamily: "inherit",
-                cursor: t.enabled ? "pointer" : "not-allowed",
+                letterSpacing: -0.1,
+                transition: "background 100ms, color 100ms",
+                cursor: disabled ? "not-allowed" : "pointer",
+                outline: "none",
+              }}
+              onMouseEnter={(e) => {
+                if (!active && !disabled) {
+                  e.currentTarget.style.color = "#334155";
+                  e.currentTarget.style.background = "#f8fafc";
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!active && !disabled) {
+                  e.currentTarget.style.color = "#64748b";
+                  e.currentTarget.style.background = "transparent";
+                }
               }}
             >
               {t.label}
-              {!t.enabled && <span style={{ fontSize: 10, marginLeft: 6 }}>(em breve)</span>}
+              {disabled && <span style={{ fontSize: 10, marginLeft: 6 }}>(em breve)</span>}
             </button>
           );
         })}

@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { Chip } from "../components/Chip";
 
 type Item = {
   log_id: number;
@@ -82,95 +83,170 @@ export default function AuditoriaPage() {
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-  const resourcesVisible = useMemo(() => {
-    return Array.from(new Set(items.map((i) => i.recurso))).sort();
-  }, [items]);
+  const opLabel = operacao
+    ? OPERACOES_KNOWN[operacao]?.label ?? operacao
+    : "todas";
+
+  const filtersActive = [recurso, operacao, usuario].filter(Boolean).length;
 
   return (
     <main style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-      {/* Toolbar de filtros */}
-      <div
-        style={{
-          display: "flex",
-          gap: 14,
-          alignItems: "flex-end",
-          padding: "12px 18px",
-          background: "#f8fafc",
-          borderBottom: "1px solid #e2e8f0",
-          flex: "0 0 auto",
-          flexWrap: "wrap",
-        }}
-      >
-        <Field label="recurso">
-          <input
-            placeholder="ex: regras.eventos"
-            value={recurso}
-            onChange={(e) => setRecurso(e.target.value)}
-            style={{ ...inp, width: 200 }}
-          />
-        </Field>
-        <Field label="operação">
-          <select value={operacao} onChange={(e) => setOperacao(e.target.value)} style={{ ...inp, width: 160 }}>
-            <option value="">todas</option>
-            <option value="create">criar</option>
-            <option value="update">atualizar</option>
-            <option value="delete">excluir</option>
-            <option value="rebuild_simulador">rebuild simulador</option>
-          </select>
-        </Field>
-        <Field label="usuário">
-          <input
-            placeholder="ex: admin"
-            value={usuario}
-            onChange={(e) => setUsuario(e.target.value)}
-            style={{ ...inp, width: 140 }}
-          />
-        </Field>
-        <Field label="linhas por página">
-          <select value={pageSize} onChange={(e) => setPageSize(Number(e.target.value))} style={{ ...inp, width: 90 }}>
-            {[25, 50, 100, 200].map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <div style={{ flex: 1 }} />
-        <button onClick={fetchLog} style={btnSecondary}>
-          atualizar
-        </button>
-      </div>
-
-      {/* Info + paginação */}
+      {/* Toolbar única: título + chips + ações */}
       <div
         style={{
           display: "flex",
           alignItems: "center",
-          gap: 10,
-          padding: "8px 18px",
-          background: "#f1f5f9",
-          borderBottom: "1px solid #e2e8f0",
-          fontSize: 12,
-          color: "#475569",
+          gap: 8,
+          padding: "0 16px",
+          height: 44,
+          background: "#ffffff",
           flex: "0 0 auto",
+          boxShadow: "0 1px 0 rgba(15,23,42,0.06)",
+          position: "relative",
+          zIndex: 5,
         }}
       >
-        <span>
-          <strong>{total}</strong> registro{total === 1 ? "" : "s"} · página <strong>{page}</strong> de <strong>{totalPages}</strong>
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#1e293b", letterSpacing: -0.1 }}>
+          Log de operações
         </span>
+        {filtersActive > 0 && (
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 600,
+              color: "#4338ca",
+              background: "#eef2ff",
+              padding: "2px 7px",
+              borderRadius: 10,
+            }}
+          >
+            {filtersActive} filtro{filtersActive > 1 ? "s" : ""}
+          </span>
+        )}
+
         <div style={{ flex: 1 }} />
-        <button onClick={() => setPage(1)} disabled={page === 1} style={pageBtn}>
-          « primeira
-        </button>
-        <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1} style={pageBtn}>
-          ‹ anterior
-        </button>
-        <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} style={pageBtn}>
-          próxima ›
-        </button>
-        <button onClick={() => setPage(totalPages)} disabled={page >= totalPages} style={pageBtn}>
-          última »
-        </button>
+
+        {loading && (
+          <span style={{ color: "#94a3b8", fontSize: 11, fontWeight: 500 }}>carregando…</span>
+        )}
+        {error && (
+          <span style={{ color: "#dc2626", fontSize: 11, fontWeight: 500 }} title={error}>
+            erro
+          </span>
+        )}
+
+        <Chip icon={<IconFilter />} value={`Operação: ${opLabel}`} width={200}>
+          {(close) => (
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {[
+                { v: "", label: "Todas" },
+                { v: "create", label: "Criar" },
+                { v: "update", label: "Atualizar" },
+                { v: "delete", label: "Excluir" },
+                { v: "rebuild_simulador", label: "Rebuild simulador" },
+              ].map((o) => {
+                const active = operacao === o.v;
+                return (
+                  <button
+                    key={o.v}
+                    onClick={() => {
+                      setOperacao(o.v);
+                      close();
+                    }}
+                    style={menuItem(active)}
+                  >
+                    {o.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Chip>
+
+        <Chip
+          icon={<IconSearch />}
+          value={recurso || usuario ? `${recurso || "—"} · ${usuario || "—"}` : "Recurso e usuário"}
+          width={260}
+        >
+          {() => (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div>
+                <Label>Recurso</Label>
+                <input
+                  placeholder="ex: regras.eventos"
+                  value={recurso}
+                  onChange={(e) => setRecurso(e.target.value)}
+                  style={popInp}
+                  autoFocus
+                />
+              </div>
+              <div>
+                <Label>Usuário</Label>
+                <input
+                  placeholder="ex: admin"
+                  value={usuario}
+                  onChange={(e) => setUsuario(e.target.value)}
+                  style={popInp}
+                />
+              </div>
+              {(recurso || usuario) && (
+                <button
+                  onClick={() => {
+                    setRecurso("");
+                    setUsuario("");
+                  }}
+                  style={{
+                    padding: "5px 8px",
+                    background: "#f8fafc",
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 5,
+                    fontSize: 11,
+                    fontWeight: 500,
+                    fontFamily: "inherit",
+                    color: "#64748b",
+                    cursor: "pointer",
+                  }}
+                >
+                  Limpar
+                </button>
+              )}
+            </div>
+          )}
+        </Chip>
+
+        <Chip icon={<IconMore />} value="" width={200}>
+          {(close) => (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+              <div style={{ padding: "4px 6px" }}>
+                <Label>Linhas por página</Label>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    close();
+                  }}
+                  style={popInp}
+                >
+                  {[25, 50, 100, 200].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ height: 1, background: "#e2e8f0", margin: "4px 0" }} />
+              <button
+                onClick={() => {
+                  fetchLog();
+                  close();
+                }}
+                style={menuItem(false)}
+              >
+                ↻ Atualizar agora
+              </button>
+            </div>
+          )}
+        </Chip>
       </div>
 
       {/* Conteúdo */}
@@ -187,12 +263,12 @@ export default function AuditoriaPage() {
           <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5 }}>
             <thead>
               <tr>
-                <th style={thCell}>data/hora</th>
-                <th style={thCell}>usuário</th>
-                <th style={thCell}>operação</th>
-                <th style={thCell}>recurso</th>
-                <th style={thCell}>id</th>
-                <th style={thCell}>detalhes</th>
+                <th style={thCell}>Data/hora</th>
+                <th style={thCell}>Usuário</th>
+                <th style={thCell}>Operação</th>
+                <th style={thCell}>Recurso</th>
+                <th style={thCell}>ID</th>
+                <th style={thCell}>Detalhes</th>
               </tr>
             </thead>
             <tbody>
@@ -238,61 +314,142 @@ export default function AuditoriaPage() {
           </table>
         )}
       </div>
+
+      {/* Footer: paginação + total */}
+      {items.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "0 16px",
+            height: 36,
+            background: "#f8fafc",
+            borderTop: "1px solid #e2e8f0",
+            fontSize: 11,
+            color: "#64748b",
+            flex: "0 0 auto",
+          }}
+        >
+          <button onClick={() => setPage(1)} disabled={page === 1} style={btnFooter}>« Primeira</button>
+          <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1} style={btnFooter}>‹ Anterior</button>
+          <span>
+            Página <strong style={{ color: "#1e293b" }}>{page}</strong> de <strong style={{ color: "#1e293b" }}>{totalPages}</strong>
+          </span>
+          <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} style={btnFooter}>Próxima ›</button>
+          <button onClick={() => setPage(totalPages)} disabled={page >= totalPages} style={btnFooter}>Última »</button>
+          <span style={{ marginLeft: 12 }}>
+            <strong style={{ color: "#1e293b" }}>{total}</strong> registro{total === 1 ? "" : "s"}
+          </span>
+        </div>
+      )}
     </main>
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function IconFilter() {
   return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-      <span style={{ fontSize: 10, color: "#64748b", letterSpacing: 0.3, fontWeight: 600, textTransform: "uppercase" }}>
-        {label}
-      </span>
-      {children}
-    </label>
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+      <path
+        d="M2 3h10l-3.5 4.5v4l-3 1v-5L2 3z"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
+
+function IconSearch() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+      <circle cx="6" cy="6" r="4" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M9 9l3 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconMore() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+      <circle cx="3" cy="7" r="1.2" fill="currentColor" />
+      <circle cx="7" cy="7" r="1.2" fill="currentColor" />
+      <circle cx="11" cy="7" r="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function Label({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontSize: 10,
+        fontWeight: 500,
+        color: "#64748b",
+        marginBottom: 4,
+        letterSpacing: 0.2,
+        textTransform: "uppercase",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function menuItem(active: boolean): React.CSSProperties {
+  return {
+    display: "block",
+    width: "100%",
+    padding: "6px 10px",
+    background: active ? "#eef2ff" : "transparent",
+    border: 0,
+    borderRadius: 5,
+    color: active ? "#4338ca" : "#1e293b",
+    fontWeight: active ? 600 : 500,
+    fontSize: 12,
+    fontFamily: "inherit",
+    cursor: "pointer",
+    textAlign: "left",
+  };
+}
+
+const popInp: React.CSSProperties = {
+  width: "100%",
+  padding: "5px 8px",
+  border: "1px solid #e2e8f0",
+  borderRadius: 5,
+  fontSize: 12,
+  fontFamily: "inherit",
+  color: "#1e293b",
+  background: "#ffffff",
+};
 
 const thCell: React.CSSProperties = {
   textAlign: "left",
   padding: "8px 10px",
-  background: "#f1f5f9",
-  borderBottom: "1px solid #cbd5e1",
-  color: "#1d4ed8",
+  background: "#f8fafc",
+  borderBottom: "1px solid #e2e8f0",
+  color: "#4338ca",
   fontWeight: 600,
   fontSize: 11,
   whiteSpace: "nowrap",
   position: "sticky",
   top: 0,
+  letterSpacing: -0.1,
 };
+
 const tdCell: React.CSSProperties = {
   padding: "6px 10px",
   verticalAlign: "top",
 };
-const inp: React.CSSProperties = {
-  padding: "6px 10px",
-  border: "1px solid #cbd5e1",
-  borderRadius: 4,
-  fontSize: 13,
-  fontFamily: "inherit",
-};
-const btnSecondary: React.CSSProperties = {
+
+const btnFooter: React.CSSProperties = {
+  padding: "3px 8px",
   background: "#ffffff",
-  color: "#475569",
-  border: "1px solid #cbd5e1",
-  padding: "6px 12px",
-  borderRadius: 5,
-  fontSize: 12,
-  cursor: "pointer",
-  fontFamily: "inherit",
-};
-const pageBtn: React.CSSProperties = {
-  background: "#ffffff",
-  color: "#475569",
-  border: "1px solid #cbd5e1",
+  border: "1px solid #e2e8f0",
   borderRadius: 4,
-  padding: "3px 10px",
   fontSize: 11,
-  cursor: "pointer",
   fontFamily: "inherit",
+  color: "#475569",
+  cursor: "pointer",
 };

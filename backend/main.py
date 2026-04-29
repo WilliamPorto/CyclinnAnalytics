@@ -1924,3 +1924,137 @@ def reload_views() -> dict:
     CON.close()
     CON = build_duckdb()
     return {"ok": True, "reloaded_at": time.time()}
+
+
+# ============================================================
+# Guesty — publicação de preços (MOCK até OAuth ser configurado)
+# ============================================================
+# Quando a integração com a Guesty estiver real, o endpoint de publicar
+# vai despachar um job assíncrono que percorre o `d` e faz PUT no
+# /availability-pricing/api/calendar/listings/{id} respeitando rate limit
+# (5.000 req/h, 120/min, 15/seg). Por enquanto, simula sucesso e registra
+# na auditoria pra exercitar o fluxo de UI.
+
+
+@app.get("/guesty/publicar/preview")
+def guesty_publicar_preview(
+    data_referencia: str,
+    data_inicio: str,
+    data_fim: str,
+    regiao_id: Optional[int] = None,
+) -> dict:
+    """Stats da publicação proposta, sem efetuar nada. Usado pelo modal."""
+    try:
+        d_ref = date.fromisoformat(data_referencia)
+        d_ini = date.fromisoformat(data_inicio)
+        d_fim = date.fromisoformat(data_fim)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Data inválida: {e}")
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="data_fim anterior a data_inicio")
+
+    where_regiao = ""
+    if regiao_id is not None:
+        where_regiao = f"""
+          AND d.unidade_id IN (
+            SELECT u.unidade_id FROM cadastro.unidades u
+            JOIN cadastro.predios p USING(predio_id)
+            WHERE p.regiao_id = {int(regiao_id)}
+          )
+        """
+
+    row = CON.execute(
+        f"""
+        SELECT
+          COUNT(DISTINCT d.unidade_id) AS unidades,
+          COUNT(*) AS total_precos,
+          SUM(d.valor - pb.valor) AS impacto_total,
+          AVG(d.valor) AS preco_medio
+        FROM {SIMULADOR_ALIAS}.main.d d
+        JOIN {SIMULADOR_ALIAS}.main.pb pb USING(data_referencia, unidade_id, data)
+        WHERE d.data_referencia = DATE '{d_ref.isoformat()}'
+          AND d.data BETWEEN DATE '{d_ini.isoformat()}' AND DATE '{d_fim.isoformat()}'
+          {where_regiao}
+        """
+    ).fetchone()
+
+    dias = (d_fim - d_ini).days + 1
+    return {
+        "unidades": int(row[0] or 0),
+        "dias": dias,
+        "total_precos": int(row[1] or 0),
+        "impacto_total": float(row[2] or 0.0),
+        "preco_medio": float(row[3] or 0.0),
+    }
+
+
+class GuestyPublicarBody(BaseModel):
+    data_referencia: str
+    data_inicio: str
+    data_fim: str
+    regiao_id: Optional[int] = None
+    sobrescrever_travados: bool = False
+    pular_bloqueios: bool = True
+
+
+@app.post("/guesty/publicar")
+def guesty_publicar(
+    body: GuestyPublicarBody,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
+    """
+    MOCK: simula a publicação dos preços do `d` no Guesty.
+
+    Quando OAuth com Guesty estiver configurado, este handler vai:
+      1. Carregar (unidade_id, data, valor) da matriz `d` no escopo dado
+      2. Mapear unidade_id → guesty_listing_id
+      3. Run-length encode dias contíguos com mesmo preço por listing
+      4. PUT /availability-pricing/api/calendar/listings/{id} com retry/backoff
+      5. Coletar sucessos/falhas e registrar na auditoria
+
+    Por enquanto: chama o preview, simula 1.5s de "rede", retorna sucesso fake.
+    """
+    preview = guesty_publicar_preview(
+        body.data_referencia,
+        body.data_inicio,
+        body.data_fim,
+        body.regiao_id,
+    )
+
+    t0 = time.perf_counter()
+    time.sleep(1.5)  # simula latência de rede com rate limit
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+
+    # Mock: simula 0.3% de falhas (rate limit / listing inativo / etc)
+    total = preview["total_precos"]
+    falhas = max(0, int(total * 0.003)) if total > 0 else 0
+    sucessos = total - falhas
+
+    log_operacao(
+        _get_usuario(x_usuario),
+        "publicacao_mock",
+        "guesty.publicacao",
+        None,
+        {
+            "data_inicio": body.data_inicio,
+            "data_fim": body.data_fim,
+            "regiao_id": body.regiao_id,
+            "sobrescrever_travados": body.sobrescrever_travados,
+            "pular_bloqueios": body.pular_bloqueios,
+            "total_precos": total,
+            "sucessos": sucessos,
+            "falhas": falhas,
+            "duration_ms": duration_ms,
+            "modo": "mock",
+        },
+    )
+
+    return {
+        "ok": True,
+        "modo": "mock",
+        "duration_ms": duration_ms,
+        "total_precos": total,
+        "sucessos": sucessos,
+        "falhas": falhas,
+        "impacto_total": preview["impacto_total"],
+    }

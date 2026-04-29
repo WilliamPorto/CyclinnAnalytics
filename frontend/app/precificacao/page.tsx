@@ -163,6 +163,8 @@ export default function DashboardsPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [publishResult, setPublishResult] = useState<PublishResult | null>(null);
 
   // Inicialização: busca data_referencias disponíveis, seta default
   useEffect(() => {
@@ -384,11 +386,436 @@ export default function DashboardsPage() {
               </strong>
             </span>
           )}
+          {activeTab === "d" && (
+            <button
+              onClick={() => setPublishOpen(true)}
+              style={{
+                marginLeft: 16,
+                background: "#4f46e5",
+                color: "#ffffff",
+                border: 0,
+                padding: "6px 14px",
+                borderRadius: 6,
+                fontSize: 12,
+                fontWeight: 600,
+                fontFamily: "inherit",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                boxShadow: "0 1px 2px rgba(79,70,229,0.25)",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "#4338ca")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "#4f46e5")}
+              title="Empurra os preços do `d` pra Guesty"
+            >
+              <IconUpload />
+              Publicar no Guesty
+            </button>
+          )}
         </div>
+      )}
+
+      {/* Modal de publicação */}
+      {publishOpen && (
+        <PublishModal
+          dataRef={dataRef}
+          dataInicio={dataInicio}
+          dataFim={dataFim}
+          onClose={() => setPublishOpen(false)}
+          onSuccess={(r) => {
+            setPublishResult(r);
+            setPublishOpen(false);
+            window.setTimeout(() => setPublishResult(null), 8000);
+          }}
+        />
+      )}
+
+      {/* Toast de resultado */}
+      {publishResult && (
+        <PublishToast result={publishResult} onClose={() => setPublishResult(null)} />
       )}
     </main>
   );
 }
+
+// ============================================================
+// Publicação no Guesty (mock)
+// ============================================================
+
+type PublishPreview = {
+  unidades: number;
+  dias: number;
+  total_precos: number;
+  impacto_total: number;
+  preco_medio: number;
+};
+
+type PublishResult = {
+  ok: boolean;
+  modo: string;
+  duration_ms: number;
+  total_precos: number;
+  sucessos: number;
+  falhas: number;
+  impacto_total: number;
+};
+
+function IconUpload() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+      <path
+        d="M7 9.5V2M7 2L4 5M7 2l3 3M2 11.5h10"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PublishModal({
+  dataRef,
+  dataInicio,
+  dataFim,
+  onClose,
+  onSuccess,
+}: {
+  dataRef: string;
+  dataInicio: string;
+  dataFim: string;
+  onClose: () => void;
+  onSuccess: (r: PublishResult) => void;
+}) {
+  const [preview, setPreview] = useState<PublishPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [periodIni, setPeriodIni] = useState(dataInicio);
+  const [periodFim, setPeriodFim] = useState(dataFim);
+  const [escopo, setEscopo] = useState<"todas" | "regiao">("todas");
+  const [regiaoId, setRegiaoId] = useState<number | null>(null);
+  const [regioes, setRegioes] = useState<{ id: number; nome: string }[]>([]);
+  const [sobrescreverTravados, setSobrescreverTravados] = useState(false);
+  const [pularBloqueios, setPularBloqueios] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitErr, setSubmitErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const ctl = new AbortController();
+    setPreviewLoading(true);
+    const qs = new URLSearchParams({
+      data_referencia: dataRef,
+      data_inicio: periodIni,
+      data_fim: periodFim,
+    });
+    if (escopo === "regiao" && regiaoId !== null) qs.set("regiao_id", String(regiaoId));
+    fetch(`/api/guesty/publicar/preview?${qs}`, { signal: ctl.signal })
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((d: PublishPreview) => setPreview(d))
+      .catch(() => {})
+      .finally(() => setPreviewLoading(false));
+    return () => ctl.abort();
+  }, [dataRef, periodIni, periodFim, escopo, regiaoId]);
+
+  useEffect(() => {
+    fetch("/api/regras/escopo/regiao")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((items: { id: number; nome: string }[]) => {
+        setRegioes(items);
+        if (items.length && regiaoId === null) setRegiaoId(items[0].id);
+      })
+      .catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submit = async () => {
+    setSubmitting(true);
+    setSubmitErr(null);
+    try {
+      const body = {
+        data_referencia: dataRef,
+        data_inicio: periodIni,
+        data_fim: periodFim,
+        regiao_id: escopo === "regiao" ? regiaoId : null,
+        sobrescrever_travados: sobrescreverTravados,
+        pular_bloqueios: pularBloqueios,
+      };
+      const r = await apiFetch("/api/guesty/publicar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail ?? `HTTP ${r.status}`);
+      onSuccess(d as PublishResult);
+    } catch (e) {
+      setSubmitErr(String(e));
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15,23,42,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 100,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: 460,
+          maxWidth: "94vw",
+          background: "#ffffff",
+          borderRadius: 10,
+          boxShadow: "0 20px 25px -5px rgba(15,23,42,0.15), 0 8px 10px -6px rgba(15,23,42,0.10)",
+          padding: 20,
+          fontSize: 13,
+          color: "#1e293b",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>Publicar preços no Guesty</span>
+          <span
+            style={{
+              fontSize: 9,
+              fontWeight: 700,
+              letterSpacing: 0.4,
+              color: "#b45309",
+              background: "#fef3c7",
+              padding: "2px 6px",
+              borderRadius: 4,
+              textTransform: "uppercase",
+            }}
+          >
+            mock
+          </span>
+        </div>
+
+        {/* Preview de stats */}
+        <div
+          style={{
+            background: "#f8fafc",
+            border: "1px solid #e2e8f0",
+            borderRadius: 8,
+            padding: "12px 14px",
+            marginBottom: 14,
+            fontSize: 12,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          {previewLoading || !preview ? (
+            <span style={{ color: "#94a3b8" }}>calculando preview…</span>
+          ) : (
+            <>
+              <Row label="Unidades">
+                <strong>{preview.unidades}</strong>
+              </Row>
+              <Row label="Dias">
+                <strong>{preview.dias}</strong>
+              </Row>
+              <Row label="Preços diários">
+                <strong>{preview.total_precos.toLocaleString("pt-BR")}</strong>
+              </Row>
+              <Row label="Impacto total vs Pb">
+                <strong style={{ color: preview.impacto_total >= 0 ? "#15803d" : "#b91c1c" }}>
+                  {preview.impacto_total >= 0 ? "+" : ""}
+                  {preview.impacto_total.toLocaleString("pt-BR", {
+                    style: "currency",
+                    currency: "BRL",
+                    maximumFractionDigits: 0,
+                  })}
+                </strong>
+              </Row>
+            </>
+          )}
+        </div>
+
+        {/* Período */}
+        <div style={{ marginBottom: 12 }}>
+          <Label>Período</Label>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <input type="date" value={periodIni} onChange={(e) => setPeriodIni(e.target.value)} style={popInp} />
+            <input type="date" value={periodFim} onChange={(e) => setPeriodFim(e.target.value)} style={popInp} />
+          </div>
+        </div>
+
+        {/* Escopo */}
+        <div style={{ marginBottom: 12 }}>
+          <Label>Escopo</Label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input type="radio" checked={escopo === "todas"} onChange={() => setEscopo("todas")} />
+              Todas as unidades
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input type="radio" checked={escopo === "regiao"} onChange={() => setEscopo("regiao")} />
+              Só uma região:
+              <select
+                value={regiaoId ?? ""}
+                onChange={(e) => setRegiaoId(Number(e.target.value))}
+                disabled={escopo !== "regiao"}
+                style={{ ...popInp, width: 180, marginLeft: 4 }}
+              >
+                {regioes.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.nome}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+
+        {/* Opções */}
+        <div style={{ marginBottom: 14 }}>
+          <Label>Opções</Label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={sobrescreverTravados}
+                onChange={(e) => setSobrescreverTravados(e.target.checked)}
+              />
+              Sobrescrever preços travados manualmente no Guesty
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={pularBloqueios}
+                onChange={(e) => setPularBloqueios(e.target.checked)}
+              />
+              Pular dias bloqueados (manutenção, etc.)
+            </label>
+          </div>
+        </div>
+
+        <div
+          style={{
+            fontSize: 11,
+            color: "#64748b",
+            paddingTop: 10,
+            borderTop: "1px solid #f1f5f9",
+            marginBottom: 14,
+          }}
+        >
+          Esta ação é registrada na Auditoria. Em modo <strong>mock</strong>, nenhum preço é
+          enviado pra Guesty — só simulamos o fluxo até a integração OAuth ficar pronta.
+        </div>
+
+        {submitErr && (
+          <div style={{ color: "#dc2626", fontSize: 12, marginBottom: 8 }}>{submitErr}</div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} disabled={submitting} style={btnSecondary}>
+            Cancelar
+          </button>
+          <button onClick={submit} disabled={submitting || !preview} style={btnPrimary}>
+            {submitting
+              ? "Publicando…"
+              : preview
+              ? `Publicar ${preview.total_precos.toLocaleString("pt-BR")}`
+              : "Publicar"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PublishToast({ result, onClose }: { result: PublishResult; onClose: () => void }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 20,
+        right: 20,
+        zIndex: 90,
+        background: "#ffffff",
+        border: "1px solid #e2e8f0",
+        borderLeft: `3px solid ${result.falhas > 0 ? "#f59e0b" : "#15803d"}`,
+        borderRadius: 8,
+        boxShadow: "0 10px 15px -3px rgba(15,23,42,0.10)",
+        padding: "12px 16px",
+        minWidth: 280,
+        fontSize: 12,
+        color: "#1e293b",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+        <span style={{ fontSize: 14 }}>{result.falhas > 0 ? "⚠" : "✓"}</span>
+        <strong style={{ fontSize: 13 }}>
+          {result.sucessos.toLocaleString("pt-BR")} preços publicados
+        </strong>
+        {result.falhas > 0 && (
+          <span style={{ color: "#b45309" }}>· {result.falhas} falharam</span>
+        )}
+        <button
+          onClick={onClose}
+          style={{
+            marginLeft: "auto",
+            background: "transparent",
+            border: 0,
+            color: "#94a3b8",
+            cursor: "pointer",
+            padding: 0,
+            fontSize: 14,
+          }}
+          aria-label="fechar"
+        >
+          ×
+        </button>
+      </div>
+      <div style={{ color: "#64748b", fontSize: 11 }}>
+        em {(result.duration_ms / 1000).toFixed(1)}s · modo {result.modo}
+      </div>
+    </div>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ color: "#64748b" }}>{label}</span>
+      <span>{children}</span>
+    </div>
+  );
+}
+
+const btnPrimary: React.CSSProperties = {
+  background: "#4f46e5",
+  color: "#ffffff",
+  border: 0,
+  padding: "7px 14px",
+  borderRadius: 6,
+  fontSize: 12,
+  fontWeight: 600,
+  fontFamily: "inherit",
+  cursor: "pointer",
+};
+
+const btnSecondary: React.CSSProperties = {
+  background: "#ffffff",
+  color: "#475569",
+  border: "1px solid #e2e8f0",
+  padding: "7px 14px",
+  borderRadius: 6,
+  fontSize: 12,
+  fontWeight: 500,
+  fontFamily: "inherit",
+  cursor: "pointer",
+};
 
 // ============================================================
 // Toolbar helpers: ícones + popovers

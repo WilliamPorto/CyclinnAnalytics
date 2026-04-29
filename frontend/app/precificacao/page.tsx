@@ -165,6 +165,7 @@ export default function DashboardsPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishResult, setPublishResult] = useState<PublishResult | null>(null);
+  const [publishDetailOpen, setPublishDetailOpen] = useState(false);
 
   // Inicialização: busca data_referencias disponíveis, seta default
   useEffect(() => {
@@ -426,14 +427,30 @@ export default function DashboardsPage() {
           onSuccess={(r) => {
             setPublishResult(r);
             setPublishOpen(false);
-            window.setTimeout(() => setPublishResult(null), 8000);
+            // auto-close só quando 100% sucesso; com falhas, fica aberto pra inspecionar
+            if (r.falhas === 0) {
+              window.setTimeout(() => setPublishResult(null), 6000);
+            }
           }}
         />
       )}
 
       {/* Toast de resultado */}
-      {publishResult && (
-        <PublishToast result={publishResult} onClose={() => setPublishResult(null)} />
+      {publishResult && !publishDetailOpen && (
+        <PublishToast
+          result={publishResult}
+          onClose={() => setPublishResult(null)}
+          onShowDetails={() => setPublishDetailOpen(true)}
+        />
+      )}
+
+      {/* Modal com detalhes das falhas */}
+      {publishDetailOpen && publishResult && (
+        <PublishDetailModal
+          result={publishResult}
+          onClose={() => setPublishDetailOpen(false)}
+          onUpdate={(r) => setPublishResult(r)}
+        />
       )}
     </main>
   );
@@ -451,6 +468,22 @@ type PublishPreview = {
   preco_medio: number;
 };
 
+type PublishError = {
+  unidade_id: number;
+  unidade_label: string;
+  data: string;
+  motivo: string;
+  motivo_label: string;
+  recuperavel: boolean;
+};
+
+type PublishErrorSummary = {
+  motivo: string;
+  motivo_label: string;
+  recuperavel: boolean;
+  quantidade: number;
+};
+
 type PublishResult = {
   ok: boolean;
   modo: string;
@@ -459,6 +492,8 @@ type PublishResult = {
   sucessos: number;
   falhas: number;
   impacto_total: number;
+  erros: PublishError[];
+  resumo_falhas: PublishErrorSummary[];
 };
 
 function IconUpload() {
@@ -734,7 +769,15 @@ function PublishModal({
   );
 }
 
-function PublishToast({ result, onClose }: { result: PublishResult; onClose: () => void }) {
+function PublishToast({
+  result,
+  onClose,
+  onShowDetails,
+}: {
+  result: PublishResult;
+  onClose: () => void;
+  onShowDetails: () => void;
+}) {
   return (
     <div
       style={{
@@ -759,7 +802,25 @@ function PublishToast({ result, onClose }: { result: PublishResult; onClose: () 
           {result.sucessos.toLocaleString("pt-BR")} preços publicados
         </strong>
         {result.falhas > 0 && (
-          <span style={{ color: "#b45309" }}>· {result.falhas} falharam</span>
+          <button
+            onClick={onShowDetails}
+            style={{
+              background: "transparent",
+              border: 0,
+              padding: 0,
+              color: "#b45309",
+              fontSize: 12,
+              fontWeight: 500,
+              fontFamily: "inherit",
+              cursor: "pointer",
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              textUnderlineOffset: 2,
+            }}
+            title="Ver detalhes das falhas"
+          >
+            · {result.falhas} falharam
+          </button>
         )}
         <button
           onClick={onClose}
@@ -783,6 +844,288 @@ function PublishToast({ result, onClose }: { result: PublishResult; onClose: () 
     </div>
   );
 }
+
+function PublishDetailModal({
+  result,
+  onClose,
+  onUpdate,
+}: {
+  result: PublishResult;
+  onClose: () => void;
+  onUpdate: (r: PublishResult) => void;
+}) {
+  const [retryState, setRetryState] = useState<"idle" | "running" | "done">("idle");
+  const [retryMsg, setRetryMsg] = useState("");
+
+  const recuperaveis = result.erros.filter((e) => e.recuperavel);
+  const permanentes = result.erros.filter((e) => !e.recuperavel);
+
+  const retryRecuperaveis = async () => {
+    setRetryState("running");
+    // Mock: simula 1s, 90% das recuperáveis viram sucesso, 10% continuam.
+    await new Promise((r) => window.setTimeout(r, 1000));
+    const ainda_falham = recuperaveis.filter((_, i) => i % 10 === 0); // 10% persistem
+    const recuperados = recuperaveis.length - ainda_falham.length;
+    const novos_erros = [...permanentes, ...ainda_falham];
+    const novo_resumo: Record<string, PublishErrorSummary> = {};
+    for (const e of novos_erros) {
+      const k = e.motivo;
+      if (!novo_resumo[k]) {
+        novo_resumo[k] = {
+          motivo: k,
+          motivo_label: e.motivo_label,
+          recuperavel: e.recuperavel,
+          quantidade: 0,
+        };
+      }
+      novo_resumo[k].quantidade += 1;
+    }
+    onUpdate({
+      ...result,
+      sucessos: result.sucessos + recuperados,
+      falhas: novos_erros.length,
+      erros: novos_erros,
+      resumo_falhas: Object.values(novo_resumo).sort(
+        (a, b) => b.quantidade - a.quantidade
+      ),
+    });
+    setRetryState("done");
+    setRetryMsg(`${recuperados} de ${recuperaveis.length} recuperados`);
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15,23,42,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 100,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: 560,
+          maxWidth: "94vw",
+          maxHeight: "82vh",
+          background: "#ffffff",
+          borderRadius: 10,
+          boxShadow:
+            "0 20px 25px -5px rgba(15,23,42,0.15), 0 8px 10px -6px rgba(15,23,42,0.10)",
+          padding: 20,
+          fontSize: 13,
+          color: "#1e293b",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>
+            {result.falhas} preços não publicados
+          </span>
+          <span
+            style={{
+              fontSize: 9,
+              fontWeight: 700,
+              letterSpacing: 0.4,
+              color: "#b45309",
+              background: "#fef3c7",
+              padding: "2px 6px",
+              borderRadius: 4,
+              textTransform: "uppercase",
+            }}
+          >
+            mock
+          </span>
+          <button
+            onClick={onClose}
+            style={{
+              marginLeft: "auto",
+              background: "transparent",
+              border: 0,
+              color: "#94a3b8",
+              cursor: "pointer",
+              padding: 4,
+              fontSize: 16,
+              lineHeight: 1,
+            }}
+            aria-label="fechar"
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Resumo por categoria */}
+        <div
+          style={{
+            background: "#f8fafc",
+            border: "1px solid #e2e8f0",
+            borderRadius: 8,
+            padding: 12,
+            marginBottom: 14,
+            fontSize: 12,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 10,
+              fontWeight: 500,
+              color: "#64748b",
+              marginBottom: 8,
+              letterSpacing: 0.2,
+              textTransform: "uppercase",
+            }}
+          >
+            Categorias
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {result.resumo_falhas.map((r) => (
+              <div
+                key={r.motivo}
+                style={{ display: "flex", alignItems: "center", gap: 10 }}
+              >
+                <span style={{ flex: 1 }}>{r.motivo_label}</span>
+                <span
+                  style={{
+                    fontVariantNumeric: "tabular-nums",
+                    fontWeight: 600,
+                    minWidth: 30,
+                    textAlign: "right",
+                  }}
+                >
+                  {r.quantidade}
+                </span>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: r.recuperavel ? "#15803d" : "#64748b",
+                    background: r.recuperavel ? "#dcfce7" : "#f1f5f9",
+                    padding: "2px 7px",
+                    borderRadius: 10,
+                    minWidth: 96,
+                    textAlign: "center",
+                  }}
+                >
+                  {r.recuperavel ? "↻ recuperável" : "permanente"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Lista detalhada (scrollable) */}
+        <div
+          style={{
+            border: "1px solid #e2e8f0",
+            borderRadius: 8,
+            overflow: "hidden",
+            marginBottom: 14,
+            flex: 1,
+            minHeight: 120,
+            maxHeight: 280,
+            overflowY: "auto",
+          }}
+        >
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+            <thead>
+              <tr>
+                <th style={detailTh}>Unidade</th>
+                <th style={detailTh}>Data</th>
+                <th style={detailTh}>Motivo</th>
+                <th style={detailTh}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {result.erros.map((e, i) => (
+                <tr key={i} style={{ borderTop: i === 0 ? 0 : "1px solid #f1f5f9" }}>
+                  <td style={detailTd}>
+                    <code style={{ fontSize: 11, color: "#1e293b" }}>{e.unidade_label}</code>
+                  </td>
+                  <td style={{ ...detailTd, fontVariantNumeric: "tabular-nums" }}>
+                    {formatBrDate(e.data)}
+                  </td>
+                  <td style={detailTd}>{e.motivo_label}</td>
+                  <td style={{ ...detailTd, textAlign: "right" }}>
+                    {e.recuperavel ? (
+                      <span style={{ fontSize: 10, color: "#15803d", fontWeight: 600 }}>↻</span>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div
+          style={{
+            fontSize: 11,
+            color: "#64748b",
+            paddingTop: 10,
+            borderTop: "1px solid #f1f5f9",
+            marginBottom: 14,
+          }}
+        >
+          Recuperáveis (rate limit, 5xx) podem ser tentadas de novo automaticamente.
+          Permanentes (listing inativo, moeda incompatível) precisam intervenção
+          operacional — geralmente ressincronizar o cadastro com o Guesty.
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8 }}>
+          {retryState === "done" && (
+            <span style={{ fontSize: 11, color: "#15803d", marginRight: "auto" }}>✓ {retryMsg}</span>
+          )}
+          <button onClick={onClose} style={btnSecondary}>
+            Fechar
+          </button>
+          {recuperaveis.length > 0 && (
+            <button
+              onClick={retryRecuperaveis}
+              disabled={retryState === "running"}
+              style={{
+                ...btnPrimary,
+                background: retryState === "running" ? "#94a3b8" : "#4f46e5",
+              }}
+            >
+              {retryState === "running"
+                ? "Tentando novamente…"
+                : `↻ Retry recuperáveis (${recuperaveis.length})`}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatBrDate(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  return `${String(d).padStart(2, "0")}/${MONTHS_PT[m - 1]}`;
+}
+
+const detailTh: React.CSSProperties = {
+  textAlign: "left",
+  padding: "6px 10px",
+  background: "#f8fafc",
+  borderBottom: "1px solid #e2e8f0",
+  color: "#4338ca",
+  fontWeight: 600,
+  fontSize: 10,
+  whiteSpace: "nowrap",
+  letterSpacing: 0.2,
+  textTransform: "uppercase",
+  position: "sticky",
+  top: 0,
+};
+
+const detailTd: React.CSSProperties = {
+  padding: "5px 10px",
+  whiteSpace: "nowrap",
+};
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (

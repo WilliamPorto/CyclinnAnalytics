@@ -12,6 +12,7 @@ Execução:
 from __future__ import annotations
 
 import json
+import random
 import subprocess
 import sys
 import time
@@ -1997,6 +1998,71 @@ class GuestyPublicarBody(BaseModel):
     pular_bloqueios: bool = True
 
 
+# Categorias de erro que podem acontecer numa publicação real no Guesty.
+# Distribuição (peso) é só pro mock — ajusta a frequência relativa de cada
+# tipo no toast de "X falharam" pra demo parecer realista.
+GUESTY_ERROR_CATEGORIES = [
+    # (key, label, recuperavel, peso)
+    ("rate_limit",            "Rate limit (HTTP 429)",     True,  0.40),
+    ("erro_rede",             "Erro de rede (5xx)",        True,  0.20),
+    ("listing_inativo",       "Listing inativo",           False, 0.15),
+    ("data_travada",          "Data travada manualmente",  False, 0.10),
+    ("listing_nao_encontrado", "Listing não encontrado",   False, 0.10),
+    ("moeda_incompativel",    "Moeda incompatível",        False, 0.05),
+]
+
+
+def _gerar_erros_mock(
+    falhas: int,
+    body: "GuestyPublicarBody",
+) -> list[dict]:
+    """Sorteia (unidade_id, data) reais do `d` no escopo dado e atribui
+    categorias de erro. Determinístico (seed fixo) pra demo previsível."""
+    if falhas <= 0:
+        return []
+
+    where_regiao = ""
+    if body.regiao_id is not None:
+        where_regiao = f"""
+          AND d.unidade_id IN (
+            SELECT u.unidade_id FROM cadastro.unidades u
+            JOIN cadastro.predios p USING(predio_id)
+            WHERE p.regiao_id = {int(body.regiao_id)}
+          )
+        """
+    rows = CON.execute(
+        f"""
+        SELECT d.unidade_id, u.codigo_externo, d.data
+        FROM {SIMULADOR_ALIAS}.main.d d
+        JOIN cadastro.unidades u ON u.unidade_id = d.unidade_id
+        WHERE d.data_referencia = DATE '{body.data_referencia}'
+          AND d.data BETWEEN DATE '{body.data_inicio}' AND DATE '{body.data_fim}'
+          {where_regiao}
+        ORDER BY HASH((d.unidade_id, d.data))
+        LIMIT {falhas}
+        """
+    ).fetchall()
+
+    rng = random.Random(42)
+    erros = []
+    for uid, label, dt in rows:
+        r = rng.random()
+        cumulative = 0.0
+        for key, lbl, recup, peso in GUESTY_ERROR_CATEGORIES:
+            cumulative += peso
+            if r < cumulative:
+                erros.append({
+                    "unidade_id": int(uid),
+                    "unidade_label": label,
+                    "data": dt.isoformat(),
+                    "motivo": key,
+                    "motivo_label": lbl,
+                    "recuperavel": recup,
+                })
+                break
+    return erros
+
+
 @app.post("/guesty/publicar")
 def guesty_publicar(
     body: GuestyPublicarBody,
@@ -2012,7 +2078,8 @@ def guesty_publicar(
       4. PUT /availability-pricing/api/calendar/listings/{id} com retry/backoff
       5. Coletar sucessos/falhas e registrar na auditoria
 
-    Por enquanto: chama o preview, simula 1.5s de "rede", retorna sucesso fake.
+    Por enquanto: simula 1.5s de "rede", retorna sucesso + amostra de erros
+    categorizados (pra UI ter o que mostrar no estado de falha).
     """
     preview = guesty_publicar_preview(
         body.data_referencia,
@@ -2025,10 +2092,25 @@ def guesty_publicar(
     time.sleep(1.5)  # simula latência de rede com rate limit
     duration_ms = int((time.perf_counter() - t0) * 1000)
 
-    # Mock: simula 0.3% de falhas (rate limit / listing inativo / etc)
+    # Mock: simula ~0.3% de falhas (rate limit / listing inativo / etc)
     total = preview["total_precos"]
-    falhas = max(0, int(total * 0.003)) if total > 0 else 0
-    sucessos = total - falhas
+    falhas_count = max(0, int(total * 0.003)) if total > 0 else 0
+    sucessos = total - falhas_count
+    erros = _gerar_erros_mock(falhas_count, body)
+
+    # Resumo por categoria (pra UI mostrar agrupado antes do detalhe linha-a-linha)
+    resumo: dict[str, dict] = {}
+    for e in erros:
+        k = e["motivo"]
+        if k not in resumo:
+            resumo[k] = {
+                "motivo": k,
+                "motivo_label": e["motivo_label"],
+                "recuperavel": e["recuperavel"],
+                "quantidade": 0,
+            }
+        resumo[k]["quantidade"] += 1
+    resumo_list = sorted(resumo.values(), key=lambda x: -x["quantidade"])
 
     log_operacao(
         _get_usuario(x_usuario),
@@ -2043,7 +2125,8 @@ def guesty_publicar(
             "pular_bloqueios": body.pular_bloqueios,
             "total_precos": total,
             "sucessos": sucessos,
-            "falhas": falhas,
+            "falhas": falhas_count,
+            "resumo_falhas": resumo_list,
             "duration_ms": duration_ms,
             "modo": "mock",
         },
@@ -2055,6 +2138,8 @@ def guesty_publicar(
         "duration_ms": duration_ms,
         "total_precos": total,
         "sucessos": sucessos,
-        "falhas": falhas,
+        "falhas": falhas_count,
         "impacto_total": preview["impacto_total"],
+        "erros": erros,
+        "resumo_falhas": resumo_list,
     }

@@ -166,6 +166,7 @@ export default function DashboardsPage() {
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishResult, setPublishResult] = useState<PublishResult | null>(null);
   const [publishDetailOpen, setPublishDetailOpen] = useState(false);
+  const [explainCell, setExplainCell] = useState<{ unidade_id: number; data: string } | null>(null);
 
   // Inicialização: busca data_referencias disponíveis, seta default
   useEffect(() => {
@@ -345,7 +346,16 @@ export default function DashboardsPage() {
 
       {/* Matriz */}
       <div style={{ flex: 1, overflow: "auto", padding: "8px 0 12px" }}>
-        {matrix && <MatrixTable matrix={matrix} />}
+        {matrix && (
+          <MatrixTable
+            matrix={matrix}
+            onCellClick={
+              matrix.row_type === "unidade"
+                ? (id, data) => setExplainCell({ unidade_id: id, data })
+                : undefined
+            }
+          />
+        )}
       </div>
 
       {/* Footer: paginação + estatísticas */}
@@ -450,6 +460,16 @@ export default function DashboardsPage() {
           result={publishResult}
           onClose={() => setPublishDetailOpen(false)}
           onUpdate={(r) => setPublishResult(r)}
+        />
+      )}
+
+      {/* Painel lateral: "Por que esse preço?" */}
+      {explainCell && (
+        <ExplainPanel
+          unidadeId={explainCell.unidade_id}
+          data={explainCell.data}
+          dataReferencia={dataRef}
+          onClose={() => setExplainCell(null)}
         />
       )}
     </main>
@@ -1439,7 +1459,13 @@ const btnFooter: React.CSSProperties = {
   cursor: "pointer",
 };
 
-function MatrixTable({ matrix }: { matrix: Matrix }) {
+function MatrixTable({
+  matrix,
+  onCellClick,
+}: {
+  matrix: Matrix;
+  onCellClick?: (id: number, data: string) => void;
+}) {
   if (matrix.rows.length === 0) {
     return <div style={{ padding: 24, color: "#64748b" }}>Sem dados para exibir.</div>;
   }
@@ -1538,9 +1564,11 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                 : useColorDriver
                 ? `${formatValue(v, matrix.format)}  ·  ${formatValue(cv, "percent")} ${deltaLabel}`
                 : formatValue(v, matrix.format);
+              const clickable = !!onCellClick && v !== null;
               return (
                 <td
                   key={i}
+                  onClick={clickable ? () => onCellClick!(row.id, matrix.columns[i]) : undefined}
                   style={{
                     background: bg,
                     color: v === null ? "#cbd5e1" : textColor(bg),
@@ -1552,8 +1580,9 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
                     whiteSpace: "nowrap",
                     minWidth: 72,
                     fontVariantNumeric: "tabular-nums",
+                    cursor: clickable ? "pointer" : "default",
                   }}
-                  title={tooltip}
+                  title={clickable ? `${tooltip} · clique pra explicar` : tooltip}
                 >
                   {v === null
                     ? "—"
@@ -1623,3 +1652,381 @@ function MatrixTable({ matrix }: { matrix: Matrix }) {
   );
 }
 
+// ============================================================
+// "Por que esse preço?" — painel lateral de decomposição
+// ============================================================
+
+type ExplainRule = {
+  regra_id: number;
+  ajuste_pct: number;
+  label: string;
+};
+
+type ExplainFator = {
+  tipo: string;
+  label: string;
+  ajuste_pct: number;
+  regras: ExplainRule[];
+  link_crud?: string | null;
+  nota?: string;
+};
+
+type ExplainData = {
+  unidade: {
+    unidade_id: number;
+    codigo_externo: string;
+    predio_nome: string;
+    regiao_nome: string;
+    segmento_nome: string | null;
+  };
+  data: string;
+  data_referencia: string;
+  pb: number;
+  fatores_priori: ExplainFator[];
+  pi: number;
+  fatores_posteriori: ExplainFator[];
+  d: number;
+};
+
+function ExplainPanel({
+  unidadeId,
+  data,
+  dataReferencia,
+  onClose,
+}: {
+  unidadeId: number;
+  data: string;
+  dataReferencia: string;
+  onClose: () => void;
+}) {
+  const [data_, setData] = useState<ExplainData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    setLoading(true);
+    setErr(null);
+    const qs = new URLSearchParams({ data_referencia: dataReferencia });
+    fetch(`/api/simulador/explicar/${unidadeId}/${data}?${qs}`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json()).detail ?? `HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((d: ExplainData) => setData(d))
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, [unidadeId, data, dataReferencia]);
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        top: 44,
+        right: 0,
+        bottom: 0,
+        width: 380,
+        maxWidth: "94vw",
+        background: "#ffffff",
+        borderLeft: "1px solid #e2e8f0",
+        boxShadow: "-8px 0 16px -8px rgba(15,23,42,0.10)",
+        zIndex: 60,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "12px 16px",
+          borderBottom: "1px solid #f1f5f9",
+          flex: "0 0 auto",
+        }}
+      >
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#1e293b" }}>
+          Por que esse preço?
+        </span>
+        <button
+          onClick={onClose}
+          style={{
+            marginLeft: "auto",
+            background: "transparent",
+            border: 0,
+            color: "#94a3b8",
+            cursor: "pointer",
+            padding: 4,
+            fontSize: 16,
+            lineHeight: 1,
+          }}
+          aria-label="fechar"
+          title="Esc"
+        >
+          ×
+        </button>
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, overflow: "auto", padding: "14px 16px" }}>
+        {loading && <div style={{ color: "#94a3b8", fontSize: 12 }}>carregando…</div>}
+        {err && <div style={{ color: "#dc2626", fontSize: 12 }}>{err}</div>}
+        {data_ && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* Identificação */}
+            <div style={{ fontSize: 12, color: "#64748b" }}>
+              <div>
+                <strong style={{ color: "#1e293b" }}>{data_.unidade.codigo_externo}</strong>
+                {" · "}
+                <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {formatBrDate(data_.data)}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, marginTop: 2 }}>
+                {data_.unidade.predio_nome} · {data_.unidade.regiao_nome}
+                {data_.unidade.segmento_nome && ` · ${data_.unidade.segmento_nome}`}
+              </div>
+            </div>
+
+            {/* Pb */}
+            <ExplainRow
+              label="Preço Base"
+              value={formatBRL(data_.pb)}
+              bold
+            />
+
+            {/* Fatores a priori */}
+            <ExplainGroupTitle>Fatores a priori</ExplainGroupTitle>
+            {data_.fatores_priori.map((f) => (
+              <ExplainFatorBlock key={f.tipo} fator={f} base={data_.pb} />
+            ))}
+
+            {/* Pi */}
+            <ExplainRow
+              label="Preço Inicial"
+              value={formatBRL(data_.pi)}
+              hint={`pb ${formatBRLDelta(data_.pi - data_.pb)}`}
+              bold
+            />
+
+            {/* Fatores a posteriori */}
+            <ExplainGroupTitle>Fatores a posteriori</ExplainGroupTitle>
+            {data_.fatores_posteriori.map((f) => (
+              <ExplainFatorBlock key={f.tipo} fator={f} base={data_.pi} />
+            ))}
+
+            {/* d */}
+            <ExplainRow
+              label="Preço Final"
+              value={formatBRL(data_.d)}
+              hint={`pi ${formatBRLDelta(data_.d - data_.pi)}`}
+              bold
+              highlight
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ExplainRow({
+  label,
+  value,
+  hint,
+  bold,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  bold?: boolean;
+  highlight?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "baseline",
+        gap: 8,
+        padding: "8px 10px",
+        background: highlight ? "#eef2ff" : "#f8fafc",
+        border: highlight ? "1px solid #c7d2fe" : "1px solid #e2e8f0",
+        borderRadius: 6,
+      }}
+    >
+      <span style={{ fontSize: 12, color: highlight ? "#4338ca" : "#475569", fontWeight: bold ? 600 : 500 }}>
+        {label}
+      </span>
+      {hint && (
+        <span style={{ fontSize: 10, color: "#94a3b8", fontVariantNumeric: "tabular-nums" }}>
+          {hint}
+        </span>
+      )}
+      <span
+        style={{
+          marginLeft: "auto",
+          fontSize: 13,
+          fontWeight: 600,
+          color: highlight ? "#4338ca" : "#1e293b",
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function ExplainGroupTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontSize: 10,
+        fontWeight: 600,
+        color: "#64748b",
+        letterSpacing: 0.4,
+        textTransform: "uppercase",
+        marginTop: 4,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function ExplainFatorBlock({ fator, base }: { fator: ExplainFator; base: number }) {
+  const sign = fator.ajuste_pct > 0 ? "+" : "";
+  const color = fator.ajuste_pct === 0 ? "#94a3b8" : fator.ajuste_pct > 0 ? "#15803d" : "#b91c1c";
+  const valor_rs = base * fator.ajuste_pct;
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "8px 10px",
+        background: "#ffffff",
+        border: "1px solid #f1f5f9",
+        borderRadius: 6,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 12, color: "#1e293b", fontWeight: 500 }}>{fator.label}</span>
+        <span
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: 1,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              color,
+              fontVariantNumeric: "tabular-nums",
+              lineHeight: 1.2,
+            }}
+          >
+            {sign}
+            {(fator.ajuste_pct * 100).toFixed(1)}%
+          </span>
+          {fator.ajuste_pct !== 0 && (
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 500,
+                color,
+                opacity: 0.75,
+                fontVariantNumeric: "tabular-nums",
+                lineHeight: 1.2,
+              }}
+            >
+              {formatBRLDelta(valor_rs)}
+            </span>
+          )}
+        </span>
+      </div>
+      {fator.regras.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
+          {fator.regras.map((r) => (
+            <div
+              key={r.regra_id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 11,
+                color: "#64748b",
+              }}
+            >
+              <span style={{ color: "#cbd5e1" }}>↳</span>
+              {fator.link_crud ? (
+                <a
+                  href={fator.link_crud}
+                  style={{
+                    color: "#4f46e5",
+                    textDecoration: "none",
+                    flex: 1,
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
+                  onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
+                >
+                  {r.label}
+                </a>
+              ) : (
+                <span style={{ flex: 1 }}>{r.label}</span>
+              )}
+              {fator.regras.length > 1 && (
+                <span style={{ fontVariantNumeric: "tabular-nums", color: "#94a3b8" }}>
+                  {r.ajuste_pct > 0 ? "+" : ""}
+                  {(r.ajuste_pct * 100).toFixed(1)}%
+                  {r.ajuste_pct !== 0 && (
+                    <span style={{ marginLeft: 4, opacity: 0.7 }}>
+                      ({formatBRLDelta(base * r.ajuste_pct)})
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {fator.regras.length === 0 && (
+        <div style={{ fontSize: 11, color: "#cbd5e1", fontStyle: "italic" }}>
+          {fator.nota ?? "nenhuma regra ativa"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatBRL(v: number): string {
+  return v.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatBRLDelta(v: number): string {
+  const sign = v >= 0 ? "+" : "−";
+  const abs = Math.abs(v).toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+    maximumFractionDigits: 2,
+  });
+  return `${sign}${abs}`;
+}

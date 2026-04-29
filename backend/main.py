@@ -570,6 +570,384 @@ def simulador_matrix(
 
 
 # ============================================================
+# Explicar preço — decomposição "Por que esse preço?"
+# ============================================================
+# Pra uma (unidade, data) específica, retorna:
+#   pb → fatores a priori (saz, dow, eventos, antecedencia) → pi
+#   pi → fatores a posteriori (ocupacao_regiao, ocupacao_individual) → d
+# Cada fator inclui as REGRAS FONTE que casaram (id + label) pra navegação ao
+# CRUD de regras.
+
+
+def _data_referencia_default() -> str:
+    row = CON.execute(
+        f"SELECT MAX(data_referencia) FROM {SIMULADOR_ALIAS}.main.simulador_meta"
+    ).fetchone()
+    if row and row[0]:
+        return row[0].isoformat()
+    raise HTTPException(status_code=500, detail="simulador sem data_referencia")
+
+
+@app.get("/simulador/explicar/{unidade_id}/{data}")
+def simulador_explicar(
+    unidade_id: int,
+    data: str,
+    data_referencia: Optional[str] = None,
+) -> dict:
+    """Decomposição completa do preço de uma (unidade, data)."""
+    try:
+        d_alvo = date.fromisoformat(data)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"data inválida: {data}")
+    d_ref = (
+        date.fromisoformat(data_referencia)
+        if data_referencia
+        else date.fromisoformat(_data_referencia_default())
+    )
+    d_alvo_s = d_alvo.isoformat()
+    d_ref_s = d_ref.isoformat()
+
+    # Metadados da unidade (precisa pra matching de escopo)
+    unit = CON.execute(
+        f"""
+        SELECT u.unidade_id, u.codigo_externo, u.predio_id, p.regiao_id, p.nome AS predio_nome,
+               r.nome AS regiao_nome, u.segmento_id, s.nome AS segmento_nome
+        FROM cadastro.unidades u
+        JOIN cadastro.predios p USING(predio_id)
+        JOIN cadastro.regioes r ON r.regiao_id = p.regiao_id
+        LEFT JOIN cadastro.segmentos s ON s.segmento_id = u.segmento_id
+        WHERE u.unidade_id = {int(unidade_id)}
+        """
+    ).fetchone()
+    if not unit:
+        raise HTTPException(status_code=404, detail=f"unidade {unidade_id} não encontrada")
+    unit = {
+        "unidade_id": unit[0], "codigo_externo": unit[1],
+        "predio_id": unit[2], "regiao_id": unit[3], "predio_nome": unit[4],
+        "regiao_nome": unit[5], "segmento_id": unit[6], "segmento_nome": unit[7],
+    }
+
+    # Valores principais da pipeline (pb, fatores, pi, d)
+    valores = CON.execute(
+        f"""
+        SELECT
+          (SELECT valor FROM {SIMULADOR_ALIAS}.main.pb
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS pb,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_sazonalidade
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS saz,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_dia_semana
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS dow,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_eventos
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS eventos,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_antecedencia
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS ant,
+          (SELECT valor FROM {SIMULADOR_ALIAS}.main.pi
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS pi,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_ajuste_regiao
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS aj_reg,
+          (SELECT ajuste_pct FROM {SIMULADOR_ALIAS}.main.fat_ajuste_individual
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS aj_ind,
+          (SELECT valor FROM {SIMULADOR_ALIAS}.main.d
+            WHERE data_referencia=DATE '{d_ref_s}' AND unidade_id={unidade_id} AND data=DATE '{d_alvo_s}') AS d
+        """
+    ).fetchone()
+    if not valores or valores[0] is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"sem dado pra (unidade={unidade_id}, data={d_alvo_s}) na referência {d_ref_s}",
+        )
+    pb, saz, dow, eventos, ant, pi, aj_reg, aj_ind, d_val = valores
+
+    # Identifica regras fonte que casaram em cada fator
+    regras_priori = {
+        "sazonalidade": _explicar_sazonalidade(d_alvo, unit),
+        "dia_semana": _explicar_dia_semana(d_alvo, unit),
+        "eventos": _explicar_eventos(d_alvo, unit),
+        "antecedencia": _explicar_antecedencia(d_alvo, d_ref, unit),
+    }
+    regras_posteriori = {
+        "ocupacao_regiao": _explicar_ocupacao_regiao(d_alvo, d_ref, unit),
+        # ocupacao_individual placeholder (sempre 0 hoje)
+    }
+
+    return {
+        "unidade": unit,
+        "data": d_alvo_s,
+        "data_referencia": d_ref_s,
+        "pb": float(pb),
+        "fatores_priori": [
+            {
+                "tipo": "sazonalidade",
+                "label": "Sazonalidade",
+                "ajuste_pct": float(saz or 0.0),
+                "regras": regras_priori["sazonalidade"],
+                "link_crud": "/regras#sazonalidade",
+            },
+            {
+                "tipo": "dia_semana",
+                "label": "Dia da semana",
+                "ajuste_pct": float(dow or 0.0),
+                "regras": regras_priori["dia_semana"],
+                "link_crud": "/regras#dia_semana",
+            },
+            {
+                "tipo": "eventos",
+                "label": "Eventos",
+                "ajuste_pct": float(eventos or 0.0),
+                "regras": regras_priori["eventos"],
+                "link_crud": "/regras#eventos",
+            },
+            {
+                "tipo": "antecedencia",
+                "label": "Antecedência",
+                "ajuste_pct": float(ant or 0.0),
+                "regras": regras_priori["antecedencia"],
+                "link_crud": "/regras#antecedencia",
+            },
+        ],
+        "pi": float(pi),
+        "fatores_posteriori": [
+            {
+                "tipo": "ocupacao_regiao",
+                "label": "Ocupação da região",
+                "ajuste_pct": float(aj_reg or 0.0),
+                "regras": regras_posteriori["ocupacao_regiao"],
+                "link_crud": "/regras#ocupacao",
+            },
+            {
+                "tipo": "ocupacao_individual",
+                "label": "Ocupação individual",
+                "ajuste_pct": float(aj_ind or 0.0),
+                "regras": [],
+                "link_crud": None,
+                "nota": "placeholder — não implementado",
+            },
+        ],
+        "d": float(d_val),
+    }
+
+
+# ── Helpers de matching de regras fonte ────────────────────────
+
+
+def _esc_match_clause(unit: dict) -> str:
+    """SQL clause pra match de escopo — multi-nível (global/regiao/predio/unidade/segmento)."""
+    return f"""(
+      r.escopo = 'global'
+      OR (r.escopo = 'regiao'   AND r.escopo_id = {int(unit['regiao_id'])})
+      OR (r.escopo = 'predio'   AND r.escopo_id = {int(unit['predio_id'])})
+      OR (r.escopo = 'segmento' AND r.escopo_id = {int(unit['segmento_id']) if unit['segmento_id'] is not None else 0})
+      OR (r.escopo = 'unidade'  AND r.escopo_id = {int(unit['unidade_id'])})
+    )"""
+
+
+def _saz_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_priori/regras_sazonalidade/regras_sazonalidade.parquet').as_posix()}'"
+
+
+def _dow_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_priori/regras_dia_semana/regras_dia_semana.parquet').as_posix()}'"
+
+
+def _eventos_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_priori/eventos/eventos.parquet').as_posix()}'"
+
+
+def _evento_impactos_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_priori/evento_impactos/evento_impactos.parquet').as_posix()}'"
+
+
+def _antecedencia_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_priori/regras_antecedencia/regras_antecedencia.parquet').as_posix()}'"
+
+
+def _ocup_regiao_parquet() -> str:
+    return f"'{(DATA_ROOT / 'regras_posteriori/regras_ocupacao_regiao/regras_ocupacao_regiao.parquet').as_posix()}'"
+
+
+def _explicar_sazonalidade(d_alvo: date, unit: dict) -> list[dict]:
+    """Todas as regras de sazonalidade que cobrem essa (unidade, data) — somam."""
+    rows = CON.execute(
+        f"""
+        SELECT r.regra_id, r.escopo, r.escopo_id, r.ajuste_pct,
+               r.data_inicio, r.data_fim, r.nome
+        FROM read_parquet({_saz_parquet()}) r
+        WHERE DATE '{d_alvo.isoformat()}' BETWEEN r.data_inicio AND r.data_fim
+          AND {_esc_match_clause(unit)}
+        ORDER BY r.regra_id
+        """
+    ).fetchall()
+    return [
+        {
+            "regra_id": int(r[0]),
+            "escopo": r[1],
+            "escopo_id": int(r[2]) if r[2] is not None else None,
+            "ajuste_pct": float(r[3]),
+            "label": (r[6] or f"Sazonalidade {r[4]} → {r[5]}"),
+        }
+        for r in rows
+    ]
+
+
+def _explicar_dia_semana(d_alvo: date, unit: dict) -> list[dict]:
+    """Regra DOW que casou (mais específica ganha)."""
+    dow_idx = (d_alvo.weekday())  # 0=segunda
+    DOW_NAMES = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+    row = CON.execute(
+        f"""
+        SELECT r.regra_id, r.escopo, r.escopo_id, r.ajuste_pct,
+               CASE r.escopo WHEN 'predio' THEN 1 WHEN 'regiao' THEN 2 WHEN 'global' THEN 3 ELSE 99 END AS prio
+        FROM read_parquet({_dow_parquet()}) r
+        WHERE r.dia_semana = {dow_idx}
+          AND r.escopo IN ('global','regiao','predio')
+          AND {_esc_match_clause(unit)}
+        ORDER BY prio
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return []
+    return [
+        {
+            "regra_id": int(row[0]),
+            "escopo": row[1],
+            "escopo_id": int(row[2]) if row[2] is not None else None,
+            "ajuste_pct": float(row[3]),
+            "label": f"{DOW_NAMES[dow_idx].capitalize()} ({row[1]})",
+        }
+    ]
+
+
+def _explicar_eventos(d_alvo: date, unit: dict) -> list[dict]:
+    """Pra cada evento ativo na data, a regra de impacto mais específica."""
+    rows = CON.execute(
+        f"""
+        WITH eventos AS (
+          SELECT evento_id, nome, data_inicio, data_fim
+          FROM read_parquet({_eventos_parquet()})
+          WHERE DATE '{d_alvo.isoformat()}' BETWEEN data_inicio AND data_fim
+        ),
+        impactos AS (
+          SELECT evento_id, escopo, escopo_id, ajuste_pct, impacto_id,
+                 CASE escopo WHEN 'unidade' THEN 1 WHEN 'predio' THEN 2 WHEN 'regiao' THEN 3 WHEN 'global' THEN 4 ELSE 99 END AS prio
+          FROM read_parquet({_evento_impactos_parquet()}) r
+          WHERE (
+            (r.escopo='unidade' AND r.escopo_id={int(unit['unidade_id'])})
+            OR (r.escopo='predio' AND r.escopo_id={int(unit['predio_id'])})
+            OR (r.escopo='regiao' AND r.escopo_id={int(unit['regiao_id'])})
+            OR r.escopo='global'
+          )
+        ),
+        ranked AS (
+          SELECT e.evento_id, e.nome, i.escopo, i.escopo_id, i.ajuste_pct, i.impacto_id,
+                 ROW_NUMBER() OVER (PARTITION BY e.evento_id ORDER BY i.prio) AS rn
+          FROM eventos e JOIN impactos i USING(evento_id)
+        )
+        SELECT evento_id, nome, escopo, escopo_id, ajuste_pct, impacto_id
+        FROM ranked WHERE rn=1
+        """
+    ).fetchall()
+    return [
+        {
+            "regra_id": int(r[5]) if r[5] is not None else int(r[0]),
+            "evento_id": int(r[0]),
+            "escopo": r[2],
+            "escopo_id": int(r[3]) if r[3] is not None else None,
+            "ajuste_pct": float(r[4]),
+            "label": f"{r[1]} ({r[2]})",
+        }
+        for r in rows
+    ]
+
+
+def _explicar_antecedencia(d_alvo: date, d_ref: date, unit: dict) -> list[dict]:
+    """Faixa de antecedência que casou."""
+    lead = (d_alvo - d_ref).days
+    dow_idx = d_alvo.weekday()
+    row = CON.execute(
+        f"""
+        SELECT r.regra_id, r.lead_min_dias, r.lead_max_dias, r.dia_semana, r.ajuste_pct,
+               CASE WHEN r.dia_semana IS NULL THEN 2 ELSE 1 END AS prio
+        FROM read_parquet({_antecedencia_parquet()}) r
+        WHERE {lead} >= r.lead_min_dias AND {lead} < r.lead_max_dias
+          AND (r.dia_semana IS NULL OR r.dia_semana = {dow_idx})
+        ORDER BY prio
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return []
+    label = f"Lead {row[1]}–{row[2]}d"
+    if row[3] is not None:
+        DOW_NAMES = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+        label += f" / {DOW_NAMES[int(row[3])]}"
+    return [
+        {
+            "regra_id": int(row[0]),
+            "lead_min_dias": int(row[1]),
+            "lead_max_dias": int(row[2]),
+            "dia_semana": int(row[3]) if row[3] is not None else None,
+            "ajuste_pct": float(row[4]),
+            "label": label,
+        }
+    ]
+
+
+def _explicar_ocupacao_regiao(d_alvo: date, d_ref: date, unit: dict) -> list[dict]:
+    """Bucket de antecedência + banda de ocupação que casou."""
+    # Lê ocupação real da região naquela data
+    ocup_row = CON.execute(
+        f"""
+        SELECT ocupacao_pct
+        FROM {SIMULADOR_ALIAS}.main.ocupacao_regiao
+        WHERE data_referencia=DATE '{d_ref.isoformat()}'
+          AND regiao_id={int(unit['regiao_id'])}
+          AND data=DATE '{d_alvo.isoformat()}'
+        """
+    ).fetchone()
+    if not ocup_row or ocup_row[0] is None:
+        return []
+    ocup_pct = float(ocup_row[0])
+
+    # Determina bucket (igual lógica de fat_ajuste_regiao)
+    lead = max(0, (d_alvo - d_ref).days)
+    janelas = CON.execute(
+        f"SELECT DISTINCT janela_dias FROM read_parquet({_ocup_regiao_parquet()}) ORDER BY janela_dias"
+    ).fetchall()
+    janelas = [int(j[0]) for j in janelas]
+    if not janelas:
+        return []
+    bucket = next((j for j in janelas if j >= lead), max(janelas))
+
+    row = CON.execute(
+        f"""
+        SELECT r.regra_id, r.janela_dias, r.ocupacao_min_pct, r.ocupacao_max_pct, r.ajuste_pct
+        FROM read_parquet({_ocup_regiao_parquet()}) r
+        WHERE r.janela_dias = {bucket}
+          AND {ocup_pct} >= r.ocupacao_min_pct
+          AND {ocup_pct} <  r.ocupacao_max_pct
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return []
+    return [
+        {
+            "regra_id": int(row[0]),
+            "janela_dias": int(row[1]),
+            "ocupacao_min_pct": float(row[2]),
+            "ocupacao_max_pct": float(row[3]),
+            "ajuste_pct": float(row[4]),
+            "ocupacao_real_pct": ocup_pct,
+            "label": (
+                f"Bucket {row[1]}d, ocupação {row[2]*100:.0f}%–{row[3]*100:.0f}% "
+                f"(real: {ocup_pct*100:.1f}%)"
+            ),
+        }
+    ]
+
+
+# ============================================================
 # Auditoria (log de operações mutáveis)
 # ============================================================
 

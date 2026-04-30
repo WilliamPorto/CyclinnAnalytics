@@ -570,6 +570,174 @@ def simulador_matrix(
 
 
 # ============================================================
+# Export de matriz — CSV / XLSX (dados completos, pivotados)
+# ============================================================
+
+
+@app.get("/simulador/export/{table}")
+def simulador_export(
+    table: str,
+    data_referencia: str,
+    data_inicio: str,
+    data_fim: str,
+    view: str = "unidade",
+    format: str = "csv",
+):
+    """
+    Exporta a matriz completa (sem paginação) em CSV ou XLSX.
+    Formato pivot: linhas = entidade (unidade/prédio/região), colunas = datas.
+    """
+    if table not in SIMULADOR_TABLES:
+        raise HTTPException(status_code=404, detail=f"Tabela '{table}' não suportada")
+    if view not in ("unidade", "regiao", "predio"):
+        raise HTTPException(status_code=400, detail=f"view inválido: {view}")
+    if format not in ("csv", "xlsx"):
+        raise HTTPException(status_code=400, detail=f"formato inválido: {format}")
+
+    try:
+        d_ref = date.fromisoformat(data_referencia)
+        d_ini = date.fromisoformat(data_inicio)
+        d_fim = date.fromisoformat(data_fim)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Data inválida: {e}")
+    if d_fim < d_ini:
+        raise HTTPException(status_code=400, detail="data_fim anterior a data_inicio")
+
+    value_col, fmt, native_row_type = SIMULADOR_TABLES[table]
+    if native_row_type == "regiao" and view == "unidade":
+        effective_row_type = "regiao"
+    else:
+        effective_row_type = view
+    needs_aggregation = native_row_type == "unidade" and effective_row_type != "unidade"
+
+    d_ref_s, d_ini_s, d_fim_s = d_ref.isoformat(), d_ini.isoformat(), d_fim.isoformat()
+
+    # Labels (pra primeira coluna)
+    if effective_row_type == "unidade":
+        labels_df = CON.execute(
+            "SELECT unidade_id AS id, codigo_externo AS label FROM cadastro.unidades ORDER BY codigo_externo"
+        ).df()
+    elif effective_row_type == "predio":
+        labels_df = CON.execute(
+            "SELECT predio_id AS id, nome AS label FROM cadastro.predios ORDER BY nome"
+        ).df()
+    else:
+        labels_df = CON.execute(
+            "SELECT regiao_id AS id, nome AS label FROM cadastro.regioes ORDER BY nome"
+        ).df()
+
+    # Query SQL pra obter (id, data, valor) — replica lógica do simulador_matrix
+    if table == "ocupacao_regiao":
+        if effective_row_type == "predio":
+            sql = f"""
+                SELECT predio_id AS id, data, ocupacao_pct AS valor
+                FROM {SIMULADOR_ALIAS}.main.ocupacao_predio
+                WHERE data_referencia = DATE '{d_ref_s}'
+                  AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+            """
+        else:
+            sql = f"""
+                SELECT regiao_id AS id, data, ocupacao_pct AS valor
+                FROM {SIMULADOR_ALIAS}.main.ocupacao_regiao
+                WHERE data_referencia = DATE '{d_ref_s}'
+                  AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+            """
+    elif table == "expectativa_regiao" and effective_row_type == "predio":
+        sql = f"""
+            SELECT predio_id AS id, data, ocupacao_esperada_pct AS valor
+            FROM {SIMULADOR_ALIAS}.main.expectativa_predio
+            WHERE data_referencia = DATE '{d_ref_s}'
+              AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+        """
+    elif not needs_aggregation:
+        key_col = "unidade_id" if native_row_type == "unidade" else "regiao_id"
+        sql = f"""
+            SELECT {key_col} AS id, data, {value_col} AS valor
+            FROM {SIMULADOR_ALIAS}.main.{table}
+            WHERE data_referencia = DATE '{d_ref_s}'
+              AND data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+        """
+    else:
+        agg_col = "p.regiao_id" if effective_row_type == "regiao" else "u.predio_id"
+        sql = f"""
+            SELECT {agg_col} AS id, t.data, AVG(t.{value_col}) AS valor
+            FROM {SIMULADOR_ALIAS}.main.{table} t
+            JOIN cadastro.unidades u ON u.unidade_id = t.unidade_id
+            JOIN cadastro.predios p USING(predio_id)
+            WHERE t.data_referencia = DATE '{d_ref_s}'
+              AND t.data BETWEEN DATE '{d_ini_s}' AND DATE '{d_fim_s}'
+            GROUP BY {agg_col}, t.data
+        """
+
+    df = CON.execute(sql).df()
+    if df.empty:
+        raise HTTPException(status_code=404, detail="sem dados pra exportar nesse período")
+
+    # Pivot pra formato matriz
+    df["data"] = pd.to_datetime(df["data"]).dt.strftime("%Y-%m-%d")
+    pivot = df.pivot_table(index="id", columns="data", values="valor", aggfunc="first")
+    # Junta com labels
+    pivot = pivot.merge(labels_df.set_index("id"), left_index=True, right_index=True, how="left")
+    # Reordena colunas: label primeiro, datas em ordem
+    date_cols = sorted(c for c in pivot.columns if c != "label")
+    pivot = pivot[["label"] + date_cols]
+    # Renomeia coluna "label" pro tipo de entidade
+    label_col_name = {"unidade": "Unidade", "predio": "Prédio", "regiao": "Região"}[effective_row_type]
+    pivot = pivot.rename(columns={"label": label_col_name})
+    pivot = pivot.sort_values(label_col_name).reset_index(drop=True)
+
+    # Filename autoexplicativo
+    safe_table = table.replace("_", "-")
+    safe_view = effective_row_type
+    filename_base = f"cyclinn_{safe_table}_{safe_view}_{d_ini_s}_{d_fim_s}"
+
+    if format == "csv":
+        from io import StringIO
+        from fastapi.responses import StreamingResponse
+
+        buf = StringIO()
+        pivot.to_csv(buf, index=False, sep=";", decimal=",")  # pt-BR: ; e ,
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename_base}.csv"',
+            },
+        )
+
+    # xlsx
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pivot.to_excel(writer, index=False, sheet_name=table[:30])
+        # Auto-ajuste de largura da primeira coluna (label) e cabeçalhos
+        ws = writer.sheets[table[:30]]
+        ws.column_dimensions["A"].width = 26
+        for col_idx in range(2, len(pivot.columns) + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            ws.column_dimensions[col_letter].width = 12
+        # Header bold
+        from openpyxl.styles import Font, PatternFill, Alignment
+        header_font = Font(bold=True, color="4338CA")
+        header_fill = PatternFill("solid", fgColor="F8FAFC")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename_base}.xlsx"',
+        },
+    )
+
+
+# ============================================================
 # Explicar preço — decomposição "Por que esse preço?"
 # ============================================================
 # Pra uma (unidade, data) específica, retorna:

@@ -327,7 +327,7 @@ export default function DashboardsPage() {
           )}
         </Chip>
 
-        <Chip icon={<IconMore />} value="" width={220}>
+        <Chip icon={<IconMore />} value="" width={240}>
           {(close) => (
             <MoreMenu
               pageSize={pageSize}
@@ -339,6 +339,14 @@ export default function DashboardsPage() {
                 setRefreshKey((k) => k + 1);
                 close();
               }}
+              exportContext={{
+                table: activeTab,
+                view,
+                dataRef,
+                dataInicio,
+                dataFim,
+              }}
+              onExportDone={close}
             />
           )}
         </Chip>
@@ -1227,6 +1235,20 @@ function IconMore() {
   );
 }
 
+function IconDownload() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
+      <path
+        d="M7 1v8M7 9L4 6M7 9l3-3M2 11.5h10"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function PeriodPopover({
   dataRef,
   dataRefs,
@@ -1341,13 +1363,25 @@ function MoreMenu({
   pageSize,
   onPageSizeChange,
   onFakeOcupacao,
+  exportContext,
+  onExportDone,
 }: {
   pageSize: number;
   onPageSizeChange: (n: number) => void;
   onFakeOcupacao: () => void;
+  exportContext: {
+    table: string;
+    view: "unidade" | "regiao" | "predio";
+    dataRef: string;
+    dataInicio: string;
+    dataFim: string;
+  };
+  onExportDone: () => void;
 }) {
   const [fakeState, setFakeState] = useState<"idle" | "running" | "ok" | "error">("idle");
   const [fakeMsg, setFakeMsg] = useState("");
+  const [exportState, setExportState] = useState<"idle" | "running" | "error">("idle");
+  const [exportErr, setExportErr] = useState("");
 
   const runFake = async () => {
     setFakeState("running");
@@ -1365,6 +1399,48 @@ function MoreMenu({
     }
   };
 
+  const runExport = async (format: "csv" | "xlsx") => {
+    setExportState("running");
+    setExportErr("");
+    try {
+      const qs = new URLSearchParams({
+        data_referencia: exportContext.dataRef,
+        data_inicio: exportContext.dataInicio,
+        data_fim: exportContext.dataFim,
+        view: exportContext.view,
+        format,
+      });
+      const r = await fetch(
+        `/api/simulador/export/${exportContext.table}?${qs}`,
+      );
+      if (!r.ok) {
+        const errorBody = await r.json().catch(() => ({}));
+        throw new Error(errorBody.detail ?? `HTTP ${r.status}`);
+      }
+      const blob = await r.blob();
+      const filename = (() => {
+        const dispo = r.headers.get("Content-Disposition") ?? "";
+        const m = dispo.match(/filename="([^"]+)"/);
+        return m
+          ? m[1]
+          : `cyclinn_${exportContext.table}_${exportContext.view}.${format}`;
+      })();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setExportState("idle");
+      onExportDone();
+    } catch (e) {
+      setExportState("error");
+      setExportErr(String(e));
+    }
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
       <div style={{ padding: "4px 6px" }}>
@@ -1376,6 +1452,66 @@ function MoreMenu({
             </option>
           ))}
         </select>
+      </div>
+      <div style={{ height: 1, background: "#e2e8f0", margin: "4px 0" }} />
+      <div style={{ padding: "4px 6px" }}>
+        <Label>Exportar matriz</Label>
+        <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
+          <button
+            onClick={() => runExport("csv")}
+            disabled={exportState === "running"}
+            style={{
+              flex: 1,
+              padding: "6px 8px",
+              background: "#f8fafc",
+              border: "1px solid #e2e8f0",
+              borderRadius: 5,
+              fontSize: 11,
+              fontWeight: 600,
+              fontFamily: "inherit",
+              color: "#475569",
+              cursor: exportState === "running" ? "not-allowed" : "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 4,
+            }}
+          >
+            <IconDownload /> CSV
+          </button>
+          <button
+            onClick={() => runExport("xlsx")}
+            disabled={exportState === "running"}
+            style={{
+              flex: 1,
+              padding: "6px 8px",
+              background: "#f0fdf4",
+              border: "1px solid #bbf7d0",
+              borderRadius: 5,
+              fontSize: 11,
+              fontWeight: 600,
+              fontFamily: "inherit",
+              color: "#166534",
+              cursor: exportState === "running" ? "not-allowed" : "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 4,
+            }}
+          >
+            <IconDownload /> Excel
+          </button>
+        </div>
+        {exportState === "running" && (
+          <span style={{ fontSize: 10, color: "#64748b", display: "block", marginTop: 4 }}>
+            preparando…
+          </span>
+        )}
+        {exportState === "error" && (
+          <span style={{ fontSize: 10, color: "#dc2626", display: "block", marginTop: 4 }}>
+            ✕ {exportErr}
+          </span>
+        )}
       </div>
       <div style={{ height: 1, background: "#e2e8f0", margin: "4px 0" }} />
       <button

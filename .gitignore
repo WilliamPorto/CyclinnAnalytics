@@ -24,8 +24,9 @@ frontend/tsconfig.tsbuildinfo
 simulador/backend/*.duckdb
 simulador/backend/*.duckdb.wal
 
-# Log de auditoria (acumula por uso, local a cada ambiente)
+# Log de auditoria + snapshots de publicação (acumulam por uso, locais a cada ambiente)
 data/auditoria/log_operacoes/
+data/auditoria/publicacoes_guesty/
 
 # Material interno / PII (confidencial — mantenha fora do repo)
 regras.pdf

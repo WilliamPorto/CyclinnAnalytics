@@ -63,6 +63,7 @@ export function NavBar() {
       </span>
       {link("/precificacao", "Precificação")}
       {link("/regras", "Regras")}
+      {link("/publicacoes", "Publicações")}
       {link("/auditoria", "Auditoria")}
     </nav>
   );

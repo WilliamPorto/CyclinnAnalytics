@@ -2306,6 +2306,96 @@ def reload_views() -> dict:
 
 
 # ============================================================
+# Publicações no Guesty — snapshots persistentes pra rollback / diff
+# ============================================================
+# Cada publicação fica salva em parquet:
+#   - publicacoes.parquet: header (1 linha por publicação)
+#   - publicacao_precos.parquet: detalhe (todos preços enviados)
+# Permite listar, comparar e reverter publicações.
+
+PUBS_DIR = DATA_ROOT / "auditoria" / "publicacoes_guesty"
+PUBS_HEADER = PUBS_DIR / "publicacoes.parquet"
+PUBS_PRECOS = PUBS_DIR / "publicacao_precos.parquet"
+
+PUBS_HEADER_COLS = [
+    "publicacao_id", "timestamp", "usuario", "modo", "tipo",
+    "escopo", "regiao_id", "regiao_nome",
+    "data_referencia", "periodo_ini", "periodo_fim",
+    "total_precos", "sucessos", "falhas",
+    "impacto_total", "duration_ms",
+    "referencia_id", "observacoes",
+]
+
+PUBS_PRECOS_COLS = [
+    "publicacao_id", "unidade_id", "data", "valor", "valor_anterior",
+]
+
+
+def _read_pubs_header() -> pd.DataFrame:
+    if not PUBS_HEADER.exists():
+        return pd.DataFrame(columns=PUBS_HEADER_COLS)
+    return pd.read_parquet(PUBS_HEADER)
+
+
+def _read_pubs_precos(pub_id: Optional[int] = None) -> pd.DataFrame:
+    if not PUBS_PRECOS.exists():
+        return pd.DataFrame(columns=PUBS_PRECOS_COLS)
+    df = pd.read_parquet(PUBS_PRECOS)
+    if pub_id is not None:
+        df = df[df["publicacao_id"] == pub_id].copy()
+    return df
+
+
+def _next_pub_id() -> int:
+    df = _read_pubs_header()
+    if df.empty:
+        return 1
+    return int(df["publicacao_id"].max()) + 1
+
+
+def _save_pub_snapshot(
+    header: dict,
+    precos_df: pd.DataFrame,
+) -> None:
+    """Append no header parquet + append nos preços. Idempotente em re-tentativas?
+    Não — assume publicacao_id único."""
+    PUBS_DIR.mkdir(parents=True, exist_ok=True)
+
+    df_h = _read_pubs_header()
+    df_h = pd.concat([df_h, pd.DataFrame([header], columns=PUBS_HEADER_COLS)], ignore_index=True)
+    df_h.to_parquet(PUBS_HEADER, index=False)
+
+    df_p = _read_pubs_precos()
+    if not precos_df.empty:
+        df_p = pd.concat([df_p, precos_df], ignore_index=True)
+        df_p.to_parquet(PUBS_PRECOS, index=False)
+
+
+def _last_pub_for_unit_data() -> dict:
+    """Retorna {(unidade_id, data_iso): valor} da última publicação por unidade-data,
+    pra computar valor_anterior. Eficiência: 1 query no parquet inteiro,
+    pega o último por (unidade_id, data) via timestamp do header."""
+    df_h = _read_pubs_header()
+    if df_h.empty:
+        return {}
+    df_p = _read_pubs_precos()
+    if df_p.empty:
+        return {}
+    merged = df_p.merge(
+        df_h[["publicacao_id", "timestamp"]],
+        on="publicacao_id",
+        how="left",
+    )
+    merged = merged.sort_values("timestamp").drop_duplicates(
+        subset=["unidade_id", "data"], keep="last"
+    )
+    return {
+        (int(r.unidade_id), str(r.data)): float(r.valor)
+        for r in merged.itertuples()
+    }
+
+
+# ============================================================
 # Guesty — publicação de preços (MOCK até OAuth ser configurado)
 # ============================================================
 # Quando a integração com a Guesty estiver real, o endpoint de publicar
@@ -2490,12 +2580,53 @@ def guesty_publicar(
         resumo[k]["quantidade"] += 1
     resumo_list = sorted(resumo.values(), key=lambda x: -x["quantidade"])
 
+    # Persistir snapshot da publicação (header + todos os preços enviados)
+    pub_id = _next_pub_id()
+    snapshot_precos = _coletar_precos_publicados(body)
+    if not snapshot_precos.empty:
+        last_map = _last_pub_for_unit_data()
+        snapshot_precos["valor_anterior"] = snapshot_precos.apply(
+            lambda r: last_map.get((int(r["unidade_id"]), str(r["data"])), None),
+            axis=1,
+        )
+        snapshot_precos.insert(0, "publicacao_id", pub_id)
+
+    regiao_nome = None
+    if body.regiao_id is not None:
+        row = CON.execute(
+            f"SELECT nome FROM cadastro.regioes WHERE regiao_id = {int(body.regiao_id)}"
+        ).fetchone()
+        regiao_nome = row[0] if row else None
+
+    header = {
+        "publicacao_id": pub_id,
+        "timestamp": datetime.now(timezone.utc),
+        "usuario": _get_usuario(x_usuario),
+        "modo": "mock",
+        "tipo": "publicacao",
+        "escopo": "regiao" if body.regiao_id is not None else "todas",
+        "regiao_id": body.regiao_id,
+        "regiao_nome": regiao_nome,
+        "data_referencia": body.data_referencia,
+        "periodo_ini": body.data_inicio,
+        "periodo_fim": body.data_fim,
+        "total_precos": total,
+        "sucessos": sucessos,
+        "falhas": falhas_count,
+        "impacto_total": float(preview["impacto_total"]),
+        "duration_ms": duration_ms,
+        "referencia_id": None,
+        "observacoes": None,
+    }
+    _save_pub_snapshot(header, snapshot_precos)
+
     log_operacao(
         _get_usuario(x_usuario),
         "publicacao_mock",
         "guesty.publicacao",
-        None,
+        str(pub_id),
         {
+            "publicacao_id": pub_id,
             "data_inicio": body.data_inicio,
             "data_fim": body.data_fim,
             "regiao_id": body.regiao_id,
@@ -2513,6 +2644,7 @@ def guesty_publicar(
     return {
         "ok": True,
         "modo": "mock",
+        "publicacao_id": pub_id,
         "duration_ms": duration_ms,
         "total_precos": total,
         "sucessos": sucessos,
@@ -2520,4 +2652,288 @@ def guesty_publicar(
         "impacto_total": preview["impacto_total"],
         "erros": erros,
         "resumo_falhas": resumo_list,
+    }
+
+
+def _coletar_precos_publicados(body: "GuestyPublicarBody") -> pd.DataFrame:
+    """Lê (unidade_id, data, valor) do `d` no escopo dado pra snapshot."""
+    where_regiao = ""
+    if body.regiao_id is not None:
+        where_regiao = f"""
+          AND d.unidade_id IN (
+            SELECT u.unidade_id FROM cadastro.unidades u
+            JOIN cadastro.predios p USING(predio_id)
+            WHERE p.regiao_id = {int(body.regiao_id)}
+          )
+        """
+    return CON.execute(
+        f"""
+        SELECT d.unidade_id, d.data::VARCHAR AS data, d.valor
+        FROM {SIMULADOR_ALIAS}.main.d d
+        WHERE d.data_referencia = DATE '{body.data_referencia}'
+          AND d.data BETWEEN DATE '{body.data_inicio}' AND DATE '{body.data_fim}'
+          {where_regiao}
+        """
+    ).df()
+
+
+# ============================================================
+# Publicações — listar, detalhes, diff, rollback
+# ============================================================
+
+
+def _publicacao_to_dict(row: pd.Series) -> dict:
+    """Normaliza uma linha do header parquet pra dict serializável."""
+    d = row.to_dict()
+    # timestamp e datas viram string
+    ts = d.get("timestamp")
+    if ts is not None and not isinstance(ts, str):
+        d["timestamp"] = pd.Timestamp(ts).isoformat()
+    for k in ("data_referencia", "periodo_ini", "periodo_fim"):
+        v = d.get(k)
+        if v is not None and not isinstance(v, str):
+            d[k] = pd.Timestamp(v).strftime("%Y-%m-%d") if pd.notna(v) else None
+    # NaN → None
+    for k, v in list(d.items()):
+        if pd.isna(v) if not isinstance(v, (list, dict)) else False:
+            d[k] = None
+    return d
+
+
+@app.get("/publicacoes")
+def listar_publicacoes(
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """Lista paginada de publicações, ordenada por timestamp desc."""
+    df = _read_pubs_header()
+    if df.empty:
+        return {"items": [], "total": 0, "page": 1, "page_size": page_size}
+
+    df = df.sort_values("timestamp", ascending=False).reset_index(drop=True)
+    total = len(df)
+    page = max(1, int(page))
+    page_size = max(1, min(200, int(page_size)))
+    start = (page - 1) * page_size
+    chunk = df.iloc[start : start + page_size]
+    items = [_publicacao_to_dict(r) for _, r in chunk.iterrows()]
+    return {"items": items, "total": int(total), "page": page, "page_size": page_size}
+
+
+@app.get("/publicacoes/{publicacao_id}")
+def detalhes_publicacao(publicacao_id: int) -> dict:
+    df_h = _read_pubs_header()
+    row = df_h[df_h["publicacao_id"] == publicacao_id]
+    if row.empty:
+        raise HTTPException(status_code=404, detail=f"publicação {publicacao_id} não encontrada")
+    header = _publicacao_to_dict(row.iloc[0])
+
+    # Encontra publicação anterior (timestamp imediatamente menor) — pra diff default
+    df_h_sorted = df_h.sort_values("timestamp")
+    idx = df_h_sorted.index[df_h_sorted["publicacao_id"] == publicacao_id].tolist()
+    anterior_id = None
+    if idx:
+        pos = df_h_sorted.index.get_loc(idx[0])
+        if pos > 0:
+            anterior_id = int(df_h_sorted.iloc[pos - 1]["publicacao_id"])
+    header["anterior_id"] = anterior_id
+    return header
+
+
+@app.get("/publicacoes/{publicacao_id}/diff")
+def diff_publicacao(
+    publicacao_id: int,
+    vs: Optional[int] = None,
+) -> dict:
+    """Compara a publicação `publicacao_id` com a `vs` (default = anterior).
+    Retorna stats agregadas + matriz de delta (unidade × data) pronta pra heatmap."""
+    df_h = _read_pubs_header()
+    row = df_h[df_h["publicacao_id"] == publicacao_id]
+    if row.empty:
+        raise HTTPException(status_code=404, detail=f"publicação {publicacao_id} não encontrada")
+
+    if vs is None:
+        det = detalhes_publicacao(publicacao_id)
+        vs = det.get("anterior_id")
+
+    df_p_atual = _read_pubs_precos(publicacao_id)[["unidade_id", "data", "valor"]].reset_index(drop=True)
+    df_p_atual = df_p_atual.rename(columns={"valor": "valor_atual"})
+
+    if vs is None:
+        # Sem publicação anterior — diff é "tudo novo"
+        merged = df_p_atual.copy()
+        merged["valor_anterior"] = None
+        merged["delta"] = None
+    else:
+        df_p_vs = _read_pubs_precos(int(vs))[["unidade_id", "data", "valor"]].reset_index(drop=True)
+        df_p_vs = df_p_vs.rename(columns={"valor": "valor_anterior"})
+        merged = df_p_atual.merge(df_p_vs, on=["unidade_id", "data"], how="outer").reset_index(drop=True)
+        merged["delta"] = merged["valor_atual"] - merged["valor_anterior"]
+
+    # Stats agregadas
+    n_inalterados = int(((merged["delta"] == 0) | (merged["delta"].isna() & merged["valor_anterior"].notna() & merged["valor_atual"].notna() & (merged["valor_anterior"] == merged["valor_atual"]))).sum())
+    n_aumentaram = int((merged["delta"] > 0).sum())
+    n_diminuiram = int((merged["delta"] < 0).sum())
+    n_novos = int((merged["valor_anterior"].isna() & merged["valor_atual"].notna()).sum())
+    n_removidos = int((merged["valor_atual"].isna() & merged["valor_anterior"].notna()).sum())
+    impacto_total = float(merged["delta"].fillna(0).sum())
+
+    # Top 20 maiores deltas (positivos e negativos)
+    top = merged.dropna(subset=["delta"]).copy()
+    top = top.assign(delta_abs=top["delta"].abs()).sort_values("delta_abs", ascending=False).head(20)
+
+    # Labels de unidade pra top
+    if not top.empty:
+        unit_ids = ",".join(str(int(u)) for u in top["unidade_id"].unique())
+        unit_labels = CON.execute(
+            f"SELECT unidade_id, codigo_externo FROM cadastro.unidades WHERE unidade_id IN ({unit_ids})"
+        ).fetchall()
+        label_map = {int(u[0]): u[1] for u in unit_labels}
+    else:
+        label_map = {}
+
+    top_list = [
+        {
+            "unidade_id": int(r["unidade_id"]),
+            "unidade_label": label_map.get(int(r["unidade_id"]), str(int(r["unidade_id"]))),
+            "data": str(r["data"]),
+            "valor_anterior": float(r["valor_anterior"]) if pd.notna(r["valor_anterior"]) else None,
+            "valor_atual": float(r["valor_atual"]) if pd.notna(r["valor_atual"]) else None,
+            "delta": float(r["delta"]) if pd.notna(r["delta"]) else None,
+        }
+        for _, r in top.iterrows()
+    ]
+
+    # Matriz pra heatmap: linhas = unidades (top 50 por |delta|), colunas = datas
+    # Sem isso, com 233 unidades a UI fica pesada. Usuário paginá pra ver mais.
+    matriz_top = merged.dropna(subset=["delta"]).copy()
+    if not matriz_top.empty:
+        # Ranking de unidades pelo somatório absoluto do delta
+        rank = matriz_top.assign(d_abs=matriz_top["delta"].abs()).groupby("unidade_id")["d_abs"].sum().sort_values(ascending=False)
+        top_units = rank.head(50).index.tolist()
+        matriz_top = matriz_top[matriz_top["unidade_id"].isin(top_units)]
+    if not matriz_top.empty:
+        unit_ids2 = ",".join(str(int(u)) for u in matriz_top["unidade_id"].unique())
+        unit_labels2 = CON.execute(
+            f"SELECT unidade_id, codigo_externo FROM cadastro.unidades WHERE unidade_id IN ({unit_ids2}) ORDER BY codigo_externo"
+        ).fetchall()
+        ordered_units = [(int(u[0]), u[1]) for u in unit_labels2]
+        all_dates = sorted(matriz_top["data"].unique().tolist())
+        delta_map = {(int(r["unidade_id"]), str(r["data"])): float(r["delta"]) for _, r in matriz_top.iterrows()}
+        atual_map = {(int(r["unidade_id"]), str(r["data"])): (float(r["valor_atual"]) if pd.notna(r["valor_atual"]) else None) for _, r in matriz_top.iterrows()}
+        matriz_rows = [
+            {
+                "unidade_id": uid,
+                "label": lbl,
+                "deltas": [delta_map.get((uid, d)) for d in all_dates],
+                "valores": [atual_map.get((uid, d)) for d in all_dates],
+            }
+            for uid, lbl in ordered_units
+        ]
+        matriz = {"columns": all_dates, "rows": matriz_rows}
+    else:
+        matriz = {"columns": [], "rows": []}
+
+    return {
+        "publicacao_id": publicacao_id,
+        "vs": vs,
+        "stats": {
+            "n_inalterados": n_inalterados,
+            "n_aumentaram": n_aumentaram,
+            "n_diminuiram": n_diminuiram,
+            "n_novos": n_novos,
+            "n_removidos": n_removidos,
+            "impacto_total": impacto_total,
+        },
+        "top": top_list,
+        "matriz": matriz,
+    }
+
+
+@app.post("/publicacoes/{publicacao_id}/rollback")
+def rollback_publicacao(
+    publicacao_id: int,
+    x_usuario: Optional[str] = Header(default=None, alias="X-Usuario"),
+) -> dict:
+    """MOCK: re-publica os preços do snapshot dado, criando uma nova publicação tipo=rollback."""
+    df_h = _read_pubs_header()
+    row = df_h[df_h["publicacao_id"] == publicacao_id]
+    if row.empty:
+        raise HTTPException(status_code=404, detail=f"publicação {publicacao_id} não encontrada")
+    pub = row.iloc[0]
+
+    df_p_origem = _read_pubs_precos(publicacao_id)
+    if df_p_origem.empty:
+        raise HTTPException(status_code=400, detail="snapshot vazio — nada pra reverter")
+
+    t0 = time.perf_counter()
+    time.sleep(1.5)
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+
+    total = len(df_p_origem)
+    falhas = max(0, int(total * 0.002))  # rollback é mais "limpo", menos falhas
+    sucessos = total - falhas
+
+    # Calcula novo valor_anterior (último estado conhecido) e impacto vs último
+    last_map = _last_pub_for_unit_data()
+    novo_pub_id = _next_pub_id()
+    novo_precos = df_p_origem[["unidade_id", "data", "valor"]].copy()
+    novo_precos["valor_anterior"] = novo_precos.apply(
+        lambda r: last_map.get((int(r["unidade_id"]), str(r["data"])), None),
+        axis=1,
+    )
+    novo_precos.insert(0, "publicacao_id", novo_pub_id)
+    impacto_total = float(
+        (novo_precos["valor"] - novo_precos["valor_anterior"].fillna(novo_precos["valor"])).sum()
+    )
+
+    header_novo = {
+        "publicacao_id": novo_pub_id,
+        "timestamp": datetime.now(timezone.utc),
+        "usuario": _get_usuario(x_usuario),
+        "modo": "mock",
+        "tipo": "rollback",
+        "escopo": pub["escopo"],
+        "regiao_id": pub["regiao_id"] if pd.notna(pub["regiao_id"]) else None,
+        "regiao_nome": pub["regiao_nome"] if pd.notna(pub["regiao_nome"]) else None,
+        "data_referencia": pub["data_referencia"],
+        "periodo_ini": pub["periodo_ini"],
+        "periodo_fim": pub["periodo_fim"],
+        "total_precos": total,
+        "sucessos": sucessos,
+        "falhas": falhas,
+        "impacto_total": impacto_total,
+        "duration_ms": duration_ms,
+        "referencia_id": int(publicacao_id),
+        "observacoes": f"rollback da publicação #{publicacao_id}",
+    }
+    _save_pub_snapshot(header_novo, novo_precos)
+
+    log_operacao(
+        _get_usuario(x_usuario),
+        "rollback_publicacao",
+        "guesty.publicacao",
+        str(novo_pub_id),
+        {
+            "publicacao_id": novo_pub_id,
+            "rollback_de": int(publicacao_id),
+            "total_precos": total,
+            "sucessos": sucessos,
+            "falhas": falhas,
+            "impacto_total": impacto_total,
+            "duration_ms": duration_ms,
+            "modo": "mock",
+        },
+    )
+
+    return {
+        "ok": True,
+        "modo": "mock",
+        "publicacao_id": novo_pub_id,
+        "rollback_de": int(publicacao_id),
+        "total_precos": total,
+        "sucessos": sucessos,
+        "falhas": falhas,
+        "impacto_total": impacto_total,
+        "duration_ms": duration_ms,
     }
